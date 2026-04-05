@@ -1,0 +1,2194 @@
+"""
+Shein Product Scraper  (改进版 v2)
+=====================
+自包含，直接调用 scrape_shein() — 无需手动配置 Chrome。
+
+改进点（相比 2026-03-29 稳定版）：
+  1. 智能等待：轮询 goods_sn 出现，最长等 PAGE_LOAD_MAX_WAIT 秒（取代固定9秒睡眠）
+  2. 并行图片下载：ThreadPoolExecutor，速度提升 5–10×
+  3. goods_imgs JSON 解析：从页面内嵌 JSON 直接获取有序商品主图（更准确）
+  4. 页面滚动：下载前滚动商品图集，触发懒加载
+  5. 关闭用完的标签页：避免 Chrome 堆积大量标签
+
+INSTALL (once):
+    pip install requests websocket-client openpyxl
+
+USAGE:
+    from shein_scraper import scrape_shein
+
+    scrape_shein("https://us.shein.com/some-product-p-123456789.html")
+    scrape_shein(["url1", "url2"], output="my_results.xlsx")
+
+EXCEL COLUMNS:
+  1. No.          行号
+  2. Date         今天日期
+  3. SKU          Shein 内部 goods_sn
+  4. Picture      第一张商品图（嵌入）
+  5. Price        售价（USD）
+  6. Shipping     $0.00（满免运费）或 $2.99
+  7. Product URL  原始链接
+  8. Store name   店铺名称
+  9. Title        商品标题
+  10. eBay price  max(Price+Shipping, 22) × 1.4
+  11. Variation 1 非尺寸属性（颜色等）
+  12. Variation 2 尺寸属性（US Size 等）
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse, unquote, urlunparse
+
+import requests
+import websocket
+from datetime import date
+from notify import alert_captcha, alert_signin, alert_generic
+from openpyxl import Workbook
+from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import coordinate_to_tuple
+
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+DEFAULT_SHIPPING_FEE   = 2.99
+EBAY_MIN_SUBTOTAL      = float(os.environ.get("SHEIN_EBAY_MIN_SUBTOTAL", "22"))
+EBAY_MARKUP            = float(os.environ.get("SHEIN_EBAY_MARKUP", "1.4"))
+CDP_PORT               = 9222
+PAGE_LOAD_MIN_WAIT     = 3        # 最少等待秒数（让 JS 初始化）
+PAGE_LOAD_MAX_WAIT     = 20       # 最多等待秒数（轮询 goods_sn）
+PAGE_LOAD_POLL_INTERVAL = 0.5     # 轮询间隔秒数
+PAGE_LOAD_RETRIES      = 3        # 遇到错误页面的最大重试次数
+RELOAD_PAUSE_SEC       = 2
+DELAY_BETWEEN_PAGES    = 2
+EXTRACTION_TIMEOUT_SEC = 120      # 单个页面提取超时（秒），超过则视为卡住
+CAPTCHA_AUTO_RETRIES   = 2        # 验证码出现时自动刷新重试次数
+PICTURE_MAX_HEIGHT_PX  = 168
+KEEP_CHROME_OPEN       = True
+PERSISTENT_PROFILE_DIR = os.path.join(os.path.expanduser("~"), "shein-cdp-profile")
+OUTPUT_ENCODING        = "utf-8"
+MEDIA_FOLDER_PREFIX    = "图片-"
+EBAY_LISTING_TXT_NAME  = "eBay上架描述.txt"
+IMAGE_DOWNLOAD_WORKERS = 8        # 并行下载线程数
+LOW_STOCK_THRESHOLD    = 15       # stock <= 此值标记 [少货]
+
+_CHROME_PATHS = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"),
+    os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+]
+
+
+# ── JavaScript: 轮询用（只检查 goods_sn 是否出现）────────────────────────────
+_JS_POLL = r"""
+(function(){
+    const scripts = [...document.querySelectorAll('script:not([src])')];
+    for (const s of scripts) {
+        const m = s.textContent.match(/"goods_sn"\s*:\s*"([^"]+)"/);
+        if (m) return m[1];
+    }
+    // Also check window vars
+    try {
+        const gs = window?.gbData?.detail?.goods_sn || window?.ProductDetailData?.detail?.goods_sn;
+        if (gs) return gs;
+    } catch(e) {}
+    return null;
+})()
+"""
+
+# ── JavaScript: 滚动商品图集（触发懒加载）────────────────────────────────────
+_JS_SCROLL_GALLERY = r"""
+(function(){
+    // 找到商品图集容器并滚动
+    const gallery = document.querySelector(
+        '.product-intro__main, .goods-detail-v3__gallery, [class*="gallery"], [class*="swiper"]'
+    );
+    if (gallery) {
+        gallery.scrollIntoView({behavior: 'instant', block: 'center'});
+    }
+    // 整体向下滚动一段，触发懒加载
+    window.scrollBy(0, 600);
+    return true;
+})()
+"""
+
+# ── JavaScript: 检测登录/验证码拦截 ──────────────────────────────────────────
+_JS_DETECT_BLOCK = r"""
+(function(){
+    var result = {blocked: false, type: null};
+    var bodyText = (document.body?.innerText || '').toLowerCase();
+    var html = document.documentElement?.innerHTML || '';
+
+    // 检测 Sign in / Register 弹窗或页面
+    var signinKeywords = ['sign in', 'log in', 'register', 'create account', 'login'];
+    var signinEls = document.querySelectorAll(
+        '[class*="login"], [class*="signin"], [class*="register"], [id*="login"], [id*="register"]'
+    );
+    // 检查是否有明显的登录弹窗覆盖了页面
+    var modal = document.querySelector(
+        '.sui-dialog__wrapper, [class*="modal"][class*="login"], [class*="overlay"][class*="login"]'
+    );
+    if (modal && modal.offsetHeight > 100) {
+        result.blocked = true;
+        result.type = 'signin_modal';
+        return result;
+    }
+    // 如果整个页面是登录页
+    if (signinKeywords.some(function(k){ return document.title.toLowerCase().includes(k); })) {
+        result.blocked = true;
+        result.type = 'signin_page';
+        return result;
+    }
+
+    // 检测验证码/人机验证
+    var captchaSelectors = [
+        'iframe[src*="captcha"]', 'iframe[src*="challenge"]',
+        'iframe[src*="recaptcha"]', 'iframe[src*="hcaptcha"]',
+        '[class*="captcha"]', '[id*="captcha"]',
+        '[class*="verify"]', '[class*="challenge"]',
+        '[class*="slider-verify"]', '[class*="puzzle"]',
+        '.geetest_panel', '#geetest', '[class*="geetest"]',
+    ];
+    for (var i = 0; i < captchaSelectors.length; i++) {
+        var el = document.querySelector(captchaSelectors[i]);
+        if (el && el.offsetHeight > 30) {
+            result.blocked = true;
+            result.type = 'captcha';
+            return result;
+        }
+    }
+
+    // 检测 "Are you a human" / "Verify you are human" 文字
+    if (/verify.{0,20}(human|person|real)|are you a (human|robot)|security check/i.test(bodyText)) {
+        result.blocked = true;
+        result.type = 'captcha_text';
+        return result;
+    }
+
+    return result;
+})()
+"""
+
+# ── JavaScript: 尝试关闭登录弹窗 ────────────────────────────────────────────
+_JS_DISMISS_SIGNIN = r"""
+(function(){
+    // 尝试点击各种关闭按钮
+    var closeSelectors = [
+        '.sui-dialog__headerbtn', '.sui-icon-common__close',
+        '[class*="modal"] [class*="close"]', '[class*="dialog"] [class*="close"]',
+        '[class*="popup"] [class*="close"]', '[aria-label="Close"]',
+        '[class*="login"] [class*="close"]', '.she-close',
+        'button[class*="close"]', '.icon-close',
+    ];
+    for (var i = 0; i < closeSelectors.length; i++) {
+        var els = document.querySelectorAll(closeSelectors[i]);
+        for (var j = 0; j < els.length; j++) {
+            try { els[j].click(); } catch(e) {}
+        }
+    }
+    // 也尝试按 Escape
+    document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', keyCode: 27, bubbles: true}));
+    return true;
+})()
+"""
+
+
+# ── JavaScript: 提取所有商品数据（主提取脚本）────────────────────────────────
+_JS = r"""
+(function() {
+    const out = {};
+    const scripts = [...document.querySelectorAll('script:not([src])')];
+    const patterns = {
+        goods_sn:   /"goods_sn"\s*:\s*"([^"]+)"/,
+        goods_id:   /"goods_id"\s*:\s*"?(\d+)"?/,
+        store_name: /"store_code"\s*:\s*"[^"]+"\s*,\s*"title"\s*:\s*"([^"]+)"/,
+    };
+    for (const s of scripts) {
+        const t = s.textContent;
+        for (const [k, p] of Object.entries(patterns)) {
+            if (!out[k]) { const m = t.match(p); if (m) out[k] = m[1]; }
+        }
+    }
+    out.title = (document.querySelector('h1')?.innerText
+                 || document.title.split('|')[0])?.trim() || '';
+    const priceEl = document.querySelector('.productPrice__main')
+        || [...document.querySelectorAll('*')].find(el =>
+               /price/i.test(el.className?.toString() || '') &&
+               /\$[\d.]+/.test(el.innerText || ''));
+    const pm = (priceEl?.innerText || '').match(/([\d.]+)/);
+    out.price = pm ? parseFloat(pm[1]) : null;
+    const shipEl = document.querySelector('.productShippingNewContent__postage-text')
+                || document.querySelector('[class*="postage-text"]');
+    const shipText = (shipEl?.innerText || '').trim();
+    out.shipping_raw       = shipText;
+    const threshM          = shipText.match(/orders?\s*(?:>=|\u2265)\s*\$([\d.]+)/i);
+    out.free_threshold     = threshM ? parseFloat(threshM[1]) : null;
+    out.unconditional_free = /free\s*shipping/i.test(shipText) && !threshM;
+    out.website = 'us.shein.com';
+    out.variations = {};
+
+    // -------- Variations (Color / Size / etc.) --------
+    function uniq(arr) {
+        const seen = new Set();
+        const out = [];
+        for (const x of arr || []) {
+            const v = (x || '').trim();
+            if (!v) continue;
+            const k = v.toLowerCase();
+            if (seen.has(k)) continue;
+            seen.add(k);
+            out.push(v);
+        }
+        return out;
+    }
+
+    function collectOptions(sec) {
+        const nodes = [
+            ...sec.querySelectorAll(
+                'button,[role="option"],[role="radio"],[aria-label],[data-attr-value],[data-value],[data-sku]'
+            ),
+            ...sec.querySelectorAll('[class*="attr-item"],[class*="attr-item__val"],[class*="swatch"],[class*="sku"],[class*="size"]'),
+        ];
+        const vals = [];
+        for (const el of nodes) {
+            const disabled = el.getAttribute('aria-disabled') === 'true' || el.disabled === true;
+            if (disabled) continue;
+            const v =
+                el.getAttribute('data-attr-value') ||
+                el.getAttribute('data-value') ||
+                el.getAttribute('aria-label') ||
+                (el.innerText || el.textContent || '');
+            const t = (v || '').replace(/\s+/g, ' ').trim();
+            if (!t) continue;
+            if (/^(add to cart|qty|quantity|size guide|sold by|shipping|reviews?)$/i.test(t)) continue;
+            if (/^(large image|show more colors|check my size)$/i.test(t)) continue;
+            vals.push(t);
+        }
+        return uniq(vals);
+    }
+
+    // A) Size section(s)
+    function extractSizes() {
+        const labelNode = [...document.querySelectorAll('*')].find(el =>
+            (el.childElementCount === 0) && /^(US\s*Size|Size)$/i.test((el.textContent || '').trim())
+        );
+        const roots = [];
+        if (labelNode) {
+            let p = labelNode.parentElement;
+            for (let i = 0; i < 6 && p; i++) { roots.push(p); p = p.parentElement; }
+        }
+        roots.push(
+            document.querySelector('.product-intro__size'),
+            ...document.querySelectorAll('[class*="size"][class*="intro"], [class*="size"] [class*="attr"]')
+        );
+
+        const seen = new Set();
+        const sizes = [];
+
+        function addSizeText(t) {
+            const v = (t || '').replace(/\s+/g, ' ').trim();
+            if (!v) return;
+            if (!/(US\s*\d|CN\s*\d|EU\s*\d)/i.test(v)) return;
+            if (/check my size/i.test(v)) return;
+            const k = v.toLowerCase();
+            if (seen.has(k)) return;
+            seen.add(k);
+            sizes.push(v.replace(/\s+\(/g, ' ('));
+        }
+
+        for (const r of roots.filter(Boolean)) {
+            for (const b of r.querySelectorAll('button,[role="option"],[role="radio"]')) {
+                addSizeText(b.innerText || b.textContent || b.getAttribute('aria-label'));
+            }
+            const txt = (r.innerText || '').replace(/\s+/g, ' ');
+            const m = txt.match(/\bUS\s*\d+(?:\.\d+)?\s*\(CN\s*\d+\)\b/gi) || [];
+            for (const x of m) addSizeText(x);
+        }
+        return sizes;
+    }
+
+    const allSizes = extractSizes();
+    if (allSizes.length) out.variations['US Size'] = allSizes;
+
+    // B) Color / other attribute sections
+    const attrSecs = document.querySelectorAll(
+        '.product-intro__color, [class*="sales-attr__fold"]:not(.product-intro__size)'
+    );
+    for (const sec of attrSecs) {
+        if (sec.classList.contains('product-intro__size')) continue;
+        const hdr = (sec.querySelector('[class*="header"]')
+                    || sec.querySelector('[class*="title"]'))
+                    ?.innerText?.split('\n')[0]?.trim() || '';
+        const ci  = hdr.indexOf(':');
+        const lbl = ci > -1 ? hdr.slice(0, ci).trim() : hdr;
+        if (!lbl) continue;
+        let selected = ci > -1 ? hdr.slice(ci + 1).trim() : '';
+
+        if (!selected) {
+            const selectedNode =
+                sec.querySelector('[aria-checked="true"]') ||
+                sec.querySelector('[aria-selected="true"]') ||
+                sec.querySelector('[aria-current="true"]') ||
+                sec.querySelector('[class*="selected"],[class*="active"],[class*="current"]');
+            selected = (selectedNode?.innerText || selectedNode?.textContent || selectedNode?.getAttribute('aria-label') || '').trim();
+        }
+
+        let opts = [...sec.querySelectorAll('[class*="attr-item__val"],[class*="swatch-item"]')]
+                        .map(el => el.innerText?.trim()).filter(Boolean);
+        if (!opts.length) opts = collectOptions(sec);
+        opts = uniq(opts)
+            .map(x => x.replace(/\s+/g, ' ').trim())
+            .filter(x => x && !/^(large image|show more colors|check my size)$/i.test(x))
+            .map(x => x.replace(/^color\s+/i, ''));
+        opts = uniq(opts);
+
+        if (selected) {
+            selected = selected.replace(/^color\s+/i, '').replace(/\s+/g, ' ').trim();
+            if (!/^(large image|show more colors|check my size)$/i.test(selected)) {
+                out.variations[lbl] = [selected];
+                continue;
+            }
+        }
+
+        if (opts.length) out.variations[lbl] = opts;
+    }
+
+    // -------- goods_imgs JSON 解析（从 "<goods_id>": [{"origin_image":...}] 中提取）--------
+    function extractGalleryFromJson() {
+        const urls = [];
+        const seenUrls = new Set();
+        function addUrl(u) {
+            if (!u || typeof u !== 'string') return;
+            let v = u.trim();
+            // 补全协议头
+            if (v.startsWith('//')) v = 'https:' + v;
+            if (!v || seenUrls.has(v)) return;
+            seenUrls.add(v);
+            urls.push(v);
+        }
+
+        // 用 goods_id 作为键去搜索 [{"origin_image":"..."},...]
+        const gid = out.goods_id;
+        if (gid) {
+            const searchKey = '"' + gid + '"';
+            for (const s of scripts) {
+                const t = s.textContent || '';
+                let searchIdx = 0;
+                while (true) {
+                    const idx = t.indexOf(searchKey, searchIdx);
+                    if (idx < 0) break;
+                    // 找冒号，然后找 [
+                    const colonIdx = t.indexOf(':', idx + searchKey.length);
+                    if (colonIdx < 0 || colonIdx > idx + searchKey.length + 5) {
+                        searchIdx = idx + searchKey.length;
+                        continue;
+                    }
+                    let vStart = colonIdx + 1;
+                    while (vStart < t.length && t[vStart] === ' ') vStart++;
+                    if (t[vStart] === '[') {
+                        let depth = 0;
+                        let end = -1;
+                        for (let j = vStart; j < t.length && j < vStart + 100000; j++) {
+                            if (t[j] === '[' || t[j] === '{') depth++;
+                            else if (t[j] === ']' || t[j] === '}') {
+                                depth--;
+                                if (depth === 0) { end = j; break; }
+                            }
+                        }
+                        if (end > 0) {
+                            try {
+                                const arr = JSON.parse(t.slice(vStart, end + 1));
+                                if (Array.isArray(arr) && arr.length > 0 && arr[0].origin_image) {
+                                    for (const item of arr) {
+                                        addUrl(item.origin_image || '');
+                                    }
+                                    if (urls.length > 0) return urls;
+                                }
+                            } catch(e) {}
+                        }
+                    }
+                    searchIdx = idx + searchKey.length;
+                }
+            }
+        }
+
+        // Fallback: 搜索 "detail_image" 数组
+        for (const s of scripts) {
+            const t = s.textContent || '';
+            if (!t.includes('"detail_image"')) continue;
+            let searchIdx = 0;
+            while (true) {
+                const idx = t.indexOf('"detail_image"', searchIdx);
+                if (idx < 0) break;
+                const colonIdx = t.indexOf(':', idx + 14);
+                if (colonIdx < 0) { searchIdx = idx + 14; continue; }
+                let vStart = colonIdx + 1;
+                while (vStart < t.length && t[vStart] === ' ') vStart++;
+                if (t[vStart] === '[') {
+                    let depth = 0;
+                    let end = -1;
+                    for (let j = vStart; j < t.length && j < vStart + 100000; j++) {
+                        if (t[j] === '[' || t[j] === '{') depth++;
+                        else if (t[j] === ']' || t[j] === '}') {
+                            depth--;
+                            if (depth === 0) { end = j; break; }
+                        }
+                    }
+                    if (end > 0) {
+                        try {
+                            const arr = JSON.parse(t.slice(vStart, end + 1));
+                            if (Array.isArray(arr) && arr.length > 0) {
+                                for (const item of arr) {
+                                    addUrl(item.origin_image || item.src || item.url || '');
+                                }
+                                if (urls.length > 0) return urls;
+                            }
+                        } catch(e) {}
+                    }
+                }
+                searchIdx = idx + 14;
+            }
+        }
+
+        return urls;
+    }
+
+    const goodsImgUrls = extractGalleryFromJson();
+    if (goodsImgUrls.length > 0) {
+        out.goods_imgs = goodsImgUrls;
+    }
+
+    // -------- Media URLs (images/videos) — 作为 fallback --------
+    function absUrl(u) {
+        try { return new URL(u, location.href).toString(); } catch (e) { return ""; }
+    }
+    function dedupe(urls) {
+        const out = [];
+        const seen = new Set();
+        for (const u of urls || []) {
+            const v = (u || "").trim();
+            if (!v) continue;
+            const key = v.split("?")[0];
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push(v);
+        }
+        return out;
+    }
+
+    function dedupeWebpPreferLarge(urls) {
+        function score(u) {
+            let s = 0;
+            const m = u.match(/\b(\d{2,4})x(\d{2,4})\b/g);
+            if (m) {
+                for (const x of m) {
+                    const ab = x.split("x");
+                    const a = parseInt(ab[0], 10), b = parseInt(ab[1], 10);
+                    if (a && b) s = Math.max(s, a * b);
+                }
+            }
+            try {
+                const sp = new URL(u, location.href).searchParams;
+                const w = parseInt(sp.get("imwidth") || sp.get("width") || sp.get("w") || "0", 10);
+                if (w > 0) s = Math.max(s, w * w);
+            } catch (e) {}
+            return s * 10000 + u.length;
+        }
+        const byStem = new Map();
+        for (const u of urls || []) {
+            const v = (u || "").trim();
+            if (!v) continue;
+            const pathOnly = v.split("?")[0];
+            const stem = pathOnly.replace(/\.webp$/i, "");
+            const prev = byStem.get(stem);
+            if (!prev || score(v) > score(prev)) byStem.set(stem, v);
+        }
+        return [...byStem.values()];
+    }
+
+    function looksLikeSheinWebp(u) {
+        const v = (u || "").trim().toLowerCase();
+        if (!v || /data:image\//i.test(v)) return false;
+        const pathOnly = v.split("?")[0];
+        const isWebp =
+            /\.webp($|\?)/.test(v) ||
+            /format[=,]webp/.test(v) ||
+            /[?&]type=webp\b/.test(v);
+        if (!isWebp) return false;
+        if (/\.(jpe?g|png|gif)($|\?)/.test(pathOnly)) return false;
+        if (!/ltwebstatic\.com|sheingroup|img\.shein\.com|\.shein\.com/i.test(v)) return false;
+        if (/sprite|icon|logo|avatar|badge|emoji|payment|banner|_ad_|promo-badge/.test(v)) return false;
+        if (/\b(50|64|72|80|96|100)x(50|64|72|80|96|100)\b/.test(v)) return false;
+        return true;
+    }
+
+    function deriveWebpCandidatesFromRaster(raw) {
+        const out = [];
+        try {
+            const u = new URL(raw, location.href);
+            const h = u.hostname.toLowerCase();
+            if (!/ltwebstatic|sheingroup|img\.shein|\.shein\.com/.test(h)) return out;
+            const p = u.pathname;
+            if (!/\.(jpe?g|png)$/i.test(p)) return out;
+            const base = p.replace(/\.(jpe?g|png)$/i, "");
+            const origin = u.origin;
+            const q = u.search || "";
+            const cand = [
+                origin + base + ".webp" + q,
+                origin + base + "_format,webp.webp" + q,
+            ];
+            for (const s of cand) {
+                if (looksLikeSheinWebp(s)) out.push(s);
+            }
+        } catch (e) {}
+        return out;
+    }
+
+    function upgradeSheinThumbnailPath(u) {
+        let s = u || "";
+        function bumpWh(prefix, w, h) {
+            const wi = parseInt(w, 10), hi = parseInt(h, 10);
+            if (!wi || !hi) return prefix + w + "x" + h;
+            const nw = Math.max(wi, 1200);
+            const nh = Math.max(hi, Math.round((nw * hi) / wi));
+            return prefix + nw + "x" + nh;
+        }
+        s = s.replace(/_square_thumbnail_(\d{3,4})x(\d{3,4})(?=[._/])/gi, (_, w, h) =>
+            bumpWh("_square_thumbnail_", w, h)
+        );
+        s = s.replace(/_thumbnail_(\d{3,4})x(\d{3,4})(?=[._/])/gi, (_, w, h) =>
+            bumpWh("_thumbnail_", w, h)
+        );
+        s = s.replace(/_thumbnail_(\d{3,4})(?=[._/])/gi, (_, n) => {
+            const v = parseInt(n, 10);
+            if (v >= 900) return `_thumbnail_${v}`;
+            return `_thumbnail_${Math.max(v, 1050)}`;
+        });
+        return s;
+    }
+    function addImwidthLarge(u) {
+        try {
+            const x = new URL(u, location.href);
+            if (!/ltwebstatic|sheingroup|img\.shein|\.shein\.com/i.test(x.hostname)) return u;
+            x.searchParams.set("imwidth", "1340");
+            return x.toString();
+        } catch (e) {
+            return u;
+        }
+    }
+    function prepGalleryWebpUrl(u) {
+        return addImwidthLarge(upgradeSheinThumbnailPath((u || "").trim()));
+    }
+
+    const imgUrls = [];
+    const videoUrls = [];
+
+    function pushImgUrl(raw) {
+        const a = absUrl(raw);
+        if (!a) return;
+        if (/data:image\//i.test(a)) return;
+        if (/(sprite|icon|logo)\./i.test(a)) return;
+        imgUrls.push(a);
+    }
+
+    function pushSrcset(attr) {
+        if (!attr) return;
+        for (const part of String(attr).split(",")) {
+            const u = part.trim().split(/\s+/)[0];
+            if (u) pushImgUrl(u);
+        }
+    }
+
+    for (const img of document.querySelectorAll("img")) {
+        pushImgUrl(img.currentSrc || img.src || "");
+        pushImgUrl(img.getAttribute("data-src") || "");
+        pushImgUrl(img.getAttribute("data-original") || "");
+        pushImgUrl(img.getAttribute("data-lazy-src") || "");
+        pushSrcset(img.getAttribute("srcset") || img.getAttribute("data-srcset") || "");
+    }
+    for (const srcEl of document.querySelectorAll("picture source[srcset], picture source[src]")) {
+        pushSrcset(srcEl.getAttribute("srcset") || "");
+        pushImgUrl(srcEl.getAttribute("src") || "");
+    }
+
+    for (const v of document.querySelectorAll("video")) {
+        const s = v.currentSrc || v.src || "";
+        const a = absUrl(s);
+        if (a) videoUrls.push(a);
+        for (const srcEl of v.querySelectorAll("source")) {
+            const a2 = absUrl(srcEl.src || srcEl.getAttribute("src") || "");
+            if (a2) videoUrls.push(a2);
+        }
+    }
+    for (const s of scripts) {
+        const t = s.textContent || "";
+        const matches = t.match(/https?:\/\/[^"'\s]+?\.(?:mp4|m3u8)(?:\?[^"'\s]*)?/gi) || [];
+        for (const m of matches) videoUrls.push(m);
+    }
+
+    const og = document.querySelector('meta[property="og:image"]')?.getAttribute("content");
+    if (og) imgUrls.push(absUrl(og));
+
+    try {
+        const entries = performance.getEntriesByType("resource") || [];
+        for (const e of entries) {
+            const n = e.name || "";
+            if (!/\.webp($|[?#])/i.test(n) && !/format[=,]webp/i.test(n)) continue;
+            if (!/ltwebstatic\.com|sheingroup|img\.shein|\.shein\.com/i.test(n)) continue;
+            pushImgUrl(n);
+        }
+    } catch (err) {}
+
+    for (const s of scripts) {
+        const t = s.textContent || "";
+        if (t.length < 100 || t.length > 3_000_000) continue;
+        const ms =
+            t.match(/https?:\/\/[^"'\\\s<>]*ltwebstatic\.com[^"'\\\s<>]*\.webp/gi) || [];
+        for (const m of ms) {
+            if (m.length < 80 || m.length > 2048) continue;
+            pushImgUrl(m);
+        }
+    }
+
+    const derived = [];
+    for (const u of imgUrls) {
+        for (const d of deriveWebpCandidatesFromRaster(u)) derived.push(d);
+    }
+    const merged = new Set();
+    for (const u of imgUrls.filter(looksLikeSheinWebp)) merged.add(prepGalleryWebpUrl(u));
+    for (const u of derived) merged.add(prepGalleryWebpUrl(u));
+    let imagesOut = dedupeWebpPreferLarge([...merged]);
+    if (!imagesOut.length) {
+        const loose = imgUrls.filter(
+            (u) => /\.webp($|\?)/i.test((u || "").trim()) && !/sprite|icon|logo|avatar/i.test((u || "").toLowerCase())
+        );
+        imagesOut = dedupeWebpPreferLarge(loose.map(prepGalleryWebpUrl));
+    }
+
+    function urlScoreQuick(u) {
+        let s = 0;
+        const m = (u || "").match(/\b(\d{2,4})x(\d{2,4})\b/g);
+        if (m) {
+            for (const x of m) {
+                const ab = x.split("x");
+                const a = parseInt(ab[0], 10), b = parseInt(ab[1], 10);
+                if (a && b) s = Math.max(s, a * b);
+            }
+        }
+        try {
+            const sp = new URL(u, location.href).searchParams;
+            const w = parseInt(sp.get("imwidth") || sp.get("width") || sp.get("w") || "0", 10);
+            if (w > 0) s = Math.max(s, w * w);
+        } catch (e) {}
+        return s * 10000 + (u || "").length;
+    }
+    imagesOut = dedupeWebpPreferLarge(imagesOut.map(prepGalleryWebpUrl));
+    imagesOut = imagesOut.filter((u) => {
+        const m = (u || "").match(/_thumbnail_(\d{3,4})(?=[._/])/i);
+        if (!m) return true;
+        return parseInt(m[1], 10) >= 600;
+    });
+    imagesOut.sort((a, b) => urlScoreQuick(b) - urlScoreQuick(a));
+    if (imagesOut.length > 120) imagesOut = imagesOut.slice(0, 120);
+
+    if (!imagesOut.length && merged.size) {
+        imagesOut = dedupeWebpPreferLarge([...merged]);
+        imagesOut.sort((a, b) => urlScoreQuick(b) - urlScoreQuick(a));
+        if (imagesOut.length > 120) imagesOut = imagesOut.slice(0, 120);
+    }
+
+    out.media = {
+        images: imagesOut,
+        videos: dedupe(videoUrls),
+    };
+
+    // -------- Per-variant pricing (from window.gbRawData) --------
+    function extractSkuPrices() {
+        try {
+            const gb = window.gbRawData;
+            if (!gb || !gb.modules || !gb.modules.saleAttr) return [];
+            const multi = gb.modules.saleAttr.multiLevelSaleAttribute;
+            if (!multi || !multi.sku_list) return [];
+            return multi.sku_list.map(function(sku) {
+                var attrs = {};
+                var arr = sku.sku_sale_attr || [];
+                for (var i = 0; i < arr.length; i++) {
+                    var a = arr[i];
+                    attrs[a.attr_name || String(a.attr_id)] = a.attr_value_name || '';
+                }
+                var sp = null, rp = null;
+                try { sp = sku.priceInfo.salePrice.amount; } catch(e) {}
+                if (sp === null) try { sp = sku.price.salePrice.amount; } catch(e) {}
+                try { rp = sku.priceInfo.retailPrice.amount; } catch(e) {}
+                if (rp === null) try { rp = sku.price.retailPrice.amount; } catch(e) {}
+                return {
+                    sku_code: sku.sku_code || '',
+                    attrs: attrs,
+                    sale_price: sp,
+                    retail_price: rp,
+                    stock: sku.stock || 0
+                };
+            });
+        } catch(e) { return []; }
+    }
+    out.sku_prices = extractSkuPrices();
+
+    return out;
+})()
+"""
+
+
+# ── Chrome launcher ───────────────────────────────────────────────────────────
+
+def _find_chrome():
+    for path in _CHROME_PATHS:
+        if os.path.exists(path):
+            return path
+    raise RuntimeError(
+        "Chrome not found. Searched:\n" + "\n".join(f"  {p}" for p in _CHROME_PATHS)
+    )
+
+
+def _launch_chrome(port=CDP_PORT, profile_dir=None):
+    chrome = _find_chrome()
+    if profile_dir is None:
+        profile_dir = tempfile.mkdtemp(prefix="shein_chrome_")
+    else:
+        os.makedirs(profile_dir, exist_ok=True)
+
+    cmd = [
+        chrome,
+        f"--remote-debugging-port={port}",
+        "--remote-allow-origins=*",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--disable-popup-blocking",
+        "--disable-blink-features=AutomationControlled",
+        "--window-size=1280,900",
+        "--new-window",
+        "about:blank",
+    ]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    for attempt in range(30):
+        try:
+            resp = requests.get(f"http://localhost:{port}/json", timeout=2)
+            tabs = resp.json()
+            if any(t.get("type") == "page" for t in tabs):
+                print(f"  Chrome ready on port {port}")
+                return proc, profile_dir
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    proc.kill()
+    raise RuntimeError(
+        f"Chrome launched (PID {proc.pid}) but port {port} never became available.\n"
+        "Try closing other Chrome windows and running again."
+    )
+
+
+def _cdp_available(port=CDP_PORT) -> bool:
+    try:
+        resp = requests.get(f"http://localhost:{port}/json", timeout=2)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _ensure_chrome(port=CDP_PORT):
+    if _cdp_available(port):
+        print(f"  Reusing existing Chrome on port {port}")
+        return None, None, False
+    proc, profile_dir = _launch_chrome(port, profile_dir=PERSISTENT_PROFILE_DIR)
+    return proc, profile_dir, True
+
+
+# ── CDP WebSocket ─────────────────────────────────────────────────────────────
+
+def _cdp_once(ws_url, method, params=None, timeout=30):
+    result = {}
+    done   = threading.Event()
+
+    def on_open(ws):
+        ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+
+    def on_message(ws, msg):
+        d = json.loads(msg)
+        if d.get("id") == 1:
+            result["data"] = d.get("result", {})
+            done.set()
+            ws.close()
+
+    def on_error(ws, err):
+        if "closed" not in str(err).lower():
+            result["error"] = str(err)
+        done.set()
+
+    ws = websocket.WebSocketApp(
+        ws_url,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+    )
+    threading.Thread(target=ws.run_forever, daemon=True).start()
+    done.wait(timeout=timeout)
+
+    if "error" in result:
+        raise RuntimeError(f"CDP error: {result['error']}")
+    return result.get("data", {})
+
+
+def _get_ws_url(port=CDP_PORT):
+    tabs = requests.get(f"http://localhost:{port}/json", timeout=5).json()
+    pages = [t for t in tabs if t.get("type") == "page"]
+    if not pages:
+        requests.get(f"http://localhost:{port}/json/new", timeout=5)
+        time.sleep(1)
+        tabs = requests.get(f"http://localhost:{port}/json", timeout=5).json()
+        pages = [t for t in tabs if t.get("type") == "page"]
+    return pages[0]["webSocketDebuggerUrl"]
+
+
+def _new_tab(port=CDP_PORT):
+    tab = requests.put(f"http://localhost:{port}/json/new", timeout=5).json()
+    return tab.get("id"), tab.get("webSocketDebuggerUrl")
+
+
+def _close_tab(port, tab_id):
+    """关闭指定标签页（用完即关，避免 Chrome 堆积）。"""
+    try:
+        requests.get(f"http://localhost:{port}/json/close/{tab_id}", timeout=5)
+    except Exception:
+        pass
+
+
+def _ws_url_for_id(port, tab_id):
+    tabs = requests.get(f"http://localhost:{port}/json", timeout=5).json()
+    for t in tabs:
+        if t.get("id") == tab_id:
+            return t.get("webSocketDebuggerUrl")
+    raise RuntimeError(f"Could not find tab id {tab_id} on port {port}")
+
+
+def _run_js(ws_url, js):
+    res = _cdp_once(ws_url, "Runtime.evaluate", {
+        "expression":    js,
+        "returnByValue": True,
+        "awaitPromise":  False,
+        "userGesture":   True,
+    })
+    if res.get("exceptionDetails"):
+        raise RuntimeError(f"JS error: {res['exceptionDetails']}")
+    return res.get("result", {}).get("value")
+
+
+# ── 智能等待：轮询 goods_sn（取代固定 sleep）────────────────────────────────
+
+def _wait_for_page_ready(port, tab_id, min_wait=PAGE_LOAD_MIN_WAIT,
+                          max_wait=PAGE_LOAD_MAX_WAIT, poll=PAGE_LOAD_POLL_INTERVAL):
+    """
+    先等 min_wait 秒，然后每 poll 秒检查一次 goods_sn 是否出现在页面中，
+    最多等 max_wait 秒。返回找到的 goods_sn 或 None（超时）。
+    """
+    time.sleep(min_wait)
+    ws_url = _ws_url_for_id(port, tab_id)
+    elapsed = min_wait
+    while elapsed < max_wait:
+        try:
+            val = _run_js(ws_url, _JS_POLL)
+            if val:
+                print(f"  页面就绪（等待 {elapsed:.1f}s，goods_sn={val}）")
+                return val, ws_url
+        except Exception:
+            pass
+        time.sleep(poll)
+        elapsed += poll
+        ws_url = _ws_url_for_id(port, tab_id)  # 刷新以防 WS URL 变化
+    print(f"  等待超时（{max_wait}s），继续尝试提取...")
+    return None, _ws_url_for_id(port, tab_id)
+
+
+def _navigate_and_wait(port, url):
+    """
+    创建新标签页，通过 CDP 导航，智能等待页面就绪。
+    返回 (ws_url, tab_id)。
+    """
+    tab_id, ws_url = _new_tab(port)
+    if not ws_url or not tab_id:
+        raise RuntimeError("Failed to create new tab via /json/new")
+    _cdp_once(ws_url, "Page.navigate", {"url": url})
+    # 智能等待
+    _, ws_url = _wait_for_page_ready(port, tab_id)
+    return _ws_url_for_id(port, tab_id), tab_id
+
+
+def _reload_tab_and_wait(port, tab_id):
+    ws_url = _ws_url_for_id(port, tab_id)
+    _cdp_once(ws_url, "Page.reload", {"ignoreCache": True})
+    _, ws_url = _wait_for_page_ready(port, tab_id)
+    return _ws_url_for_id(port, tab_id)
+
+
+def _take_screenshot(ws_url, save_path: str) -> bool:
+    """通过 CDP 截图并保存为 PNG。"""
+    try:
+        import base64
+        res = _cdp_once(ws_url, "Page.captureScreenshot", {"format": "png"}, timeout=15)
+        data_b64 = res.get("data")
+        if data_b64:
+            Path(save_path).write_bytes(base64.b64decode(data_b64))
+            return True
+    except Exception as e:
+        print(f"  [截图失败] {e}")
+    return False
+
+
+def _check_and_handle_block(port, tab_id, url, base_dir, max_wait=300):
+    """
+    检测登录弹窗/验证码拦截。
+    - 登录弹窗：自动尝试关闭
+    - 验证码：先尝试自动刷新绕过，再等待人工解决
+    - 超时未解决：截图 + 发邮件通知
+    返回 True 表示已解决或无拦截，False 表示仍被拦截。
+    """
+    ws_url = _ws_url_for_id(port, tab_id)
+    try:
+        result = _run_js(ws_url, _JS_DETECT_BLOCK)
+    except Exception:
+        return True  # 检测失败，继续正常流程
+
+    if not isinstance(result, dict) or not result.get("blocked"):
+        return True  # 没有被拦截
+
+    block_type = result.get("type", "unknown")
+    print(f"  [拦截检测] 类型: {block_type}")
+
+    # ── 登录弹窗：尝试自动关闭 ──
+    if "signin" in block_type:
+        print("  [拦截处理] 尝试关闭登录弹窗...")
+        for attempt in range(3):
+            try:
+                ws_url = _ws_url_for_id(port, tab_id)
+                _run_js(ws_url, _JS_DISMISS_SIGNIN)
+                time.sleep(1.5)
+                ws_url = _ws_url_for_id(port, tab_id)
+                check = _run_js(ws_url, _JS_DETECT_BLOCK)
+                if not isinstance(check, dict) or not check.get("blocked"):
+                    print("  [拦截处理] 登录弹窗已关闭")
+                    return True
+            except Exception:
+                pass
+        # 3 次尝试失败，截图 + 通知
+        print("  [拦截处理] 登录弹窗关闭失败，发送通知...")
+        ss_path = str(Path(base_dir) / "_block_screenshot.png")
+        try:
+            ws_url = _ws_url_for_id(port, tab_id)
+            _take_screenshot(ws_url, ss_path)
+        except Exception:
+            ss_path = None
+        alert_signin(url, screenshot_path=ss_path)
+        return False
+
+    # ── 验证码：先自动刷新重试，再等待 ──
+    if "captcha" in block_type:
+        # 第一步：尝试自动刷新绕过验证码
+        for retry in range(CAPTCHA_AUTO_RETRIES):
+            print(f"  [拦截处理] 验证码自动重试 {retry + 1}/{CAPTCHA_AUTO_RETRIES}：刷新页面...")
+            try:
+                ws_url = _ws_url_for_id(port, tab_id)
+                _cdp_once(ws_url, "Page.navigate", {"url": url})
+                _wait_for_page_ready(port, tab_id)
+                time.sleep(2)
+                ws_url = _ws_url_for_id(port, tab_id)
+                check = _run_js(ws_url, _JS_DETECT_BLOCK)
+                if not isinstance(check, dict) or not check.get("blocked"):
+                    print(f"  [拦截处理] 刷新后验证码已消失（重试 {retry + 1}）")
+                    return True
+            except Exception:
+                pass
+            time.sleep(3)
+
+        # 第二步：自动重试失败，立即截图 + 发邮件，然后继续等待
+        print(f"  [拦截处理] 自动重试失败，发送邮件通知，同时等待解决（最多 {max_wait}s）...")
+        ss_path = str(Path(base_dir) / "_block_screenshot.png")
+        try:
+            ws_url = _ws_url_for_id(port, tab_id)
+            _take_screenshot(ws_url, ss_path)
+        except Exception:
+            ss_path = None
+        alert_captcha(url, screenshot_path=ss_path)
+
+        # 第三步：继续等待人工解决
+        elapsed = 0
+        poll = 15
+        while elapsed < max_wait:
+            time.sleep(poll)
+            elapsed += poll
+            try:
+                ws_url = _ws_url_for_id(port, tab_id)
+                check = _run_js(ws_url, _JS_DETECT_BLOCK)
+                if not isinstance(check, dict) or not check.get("blocked"):
+                    print(f"  [拦截处理] 验证码已通过（等了 {elapsed}s）")
+                    return True
+            except Exception:
+                pass
+            print(f"  [拦截处理] 仍在等待验证码... ({elapsed}/{max_wait}s)")
+
+        # 超时
+        print("  [拦截处理] 验证码等待超时")
+        return False
+
+    return True
+
+
+def _shein_page_needs_retry(data) -> bool:
+    if not isinstance(data, dict):
+        return True
+    t = (data.get("title") or "").strip().lower()
+    err_markers = (
+        "bad gateway", "502 bad", "503", "504",
+        "gateway time-out", "gateway timeout",
+        "service unavailable", "error 502", "error 503",
+        "nginx", "cloudflare",
+    )
+    if any(m in t for m in err_markers):
+        return True
+    if not (data.get("goods_sn") or str(data.get("goods_id") or "").strip()):
+        if t in ("bad gateway", "502", "503", "504", "error"):
+            return True
+        if "error" in t and len(t) < 40 and not data.get("price"):
+            return True
+    return False
+
+
+# ── Shipping & pricing ────────────────────────────────────────────────────────
+
+def _calc_shipping(data):
+    price     = data.get("price") or 0.0
+    threshold = data.get("free_threshold")
+    uncon     = data.get("unconditional_free", False)
+    if uncon:                  return 0.0
+    if threshold is not None:  return 0.0 if price >= threshold else DEFAULT_SHIPPING_FEE
+    return DEFAULT_SHIPPING_FEE
+
+
+def _ebay_listing_price(price: float, shipping: float) -> float:
+    base = float(price or 0) + float(shipping or 0)
+    return round(max(base, EBAY_MIN_SUBTOTAL) * EBAY_MARKUP, 2)
+
+
+def _split_variations_for_excel(variations: dict, sku_prices: list = None,
+                                shipping: float = 0.0) -> tuple[str, str]:
+    """
+    Variation 1: 非尺寸属性（颜色等）
+    Variation 2: 尺寸属性 + 每个尺寸的价格（如有不同价格）
+    """
+    if not variations or not isinstance(variations, dict):
+        return "", ""
+
+    sku_prices = sku_prices or []
+
+    def fmt_line(key: str) -> str:
+        v = variations[key]
+        vals = v if isinstance(v, list) else [v]
+        return f"{key}: {', '.join(map(str, vals))}"
+
+    keys = list(variations.keys())
+    size_keys = [k for k in keys if re.search(r"\bsize\b", k, re.I)]
+    size_set = set(size_keys)
+    non_size_keys = [k for k in keys if k not in size_set]
+
+    # 构建 size → price 映射
+    size_price_map = {}
+    if sku_prices:
+        for sp in sku_prices:
+            attrs = sp.get("attrs") or {}
+            sale = sp.get("sale_price")
+            if sale is None:
+                continue
+            # 找到 size 属性
+            for ak, av in attrs.items():
+                if re.search(r"\bsize\b", ak, re.I) and av:
+                    size_price_map[av] = float(sale)
+                    break
+
+    # 检查是否所有 size 价格都一样
+    unique_prices = set(size_price_map.values())
+    prices_vary = len(unique_prices) > 1
+
+    def fmt_size_line(key: str) -> str:
+        v = variations[key]
+        vals = v if isinstance(v, list) else [v]
+        if prices_vary and size_price_map:
+            parts = []
+            for sv in vals:
+                p = size_price_map.get(sv)
+                if p is not None:
+                    ebay_p = _ebay_listing_price(p, shipping)
+                    parts.append(f"{sv}: ${p:.2f}→eBay${ebay_p:.2f}")
+                else:
+                    parts.append(str(sv))
+            return f"{key}:\n" + "\n".join(f"  {p}" for p in parts)
+        return f"{key}: {', '.join(map(str, vals))}"
+
+    v1_parts = [fmt_line(k) for k in non_size_keys] if non_size_keys else []
+    v2_parts = [fmt_size_line(k) for k in size_keys] if size_keys else []
+
+    if size_keys and non_size_keys:
+        return "\n".join(v1_parts), "\n".join(v2_parts)
+    if size_keys:
+        return "\n".join(v2_parts), ""
+    if len(keys) == 1:
+        return fmt_line(keys[0]), ""
+    return "\n".join(fmt_line(k) for k in keys), ""
+
+
+# ── Image helpers ─────────────────────────────────────────────────────────────
+
+def _first_product_image_path(folder) -> "Path | None":
+    if folder is None or not Path(folder).is_dir():
+        return None
+    p = Path(folder) / "img_001.webp"
+    if p.is_file():
+        return p
+    imgs = sorted(Path(folder).glob("img_*.*"))
+    return imgs[0] if imgs else None
+
+
+def _remove_images_at_cell(ws, row: int, col: int) -> None:
+    imgs = getattr(ws, "_images", None) or []
+    if not imgs:
+        return
+    keep: list = []
+    for im in imgs:
+        a = im.anchor
+        r = c = None
+        if isinstance(a, str):
+            try:
+                r, c = coordinate_to_tuple(a.upper())
+            except Exception:
+                r = c = None
+        elif a is not None and hasattr(a, "_from"):
+            r, c = a._from.row + 1, a._from.col + 1
+        if r == row and c == col:
+            continue
+        keep.append(im)
+    ws._images = keep
+
+
+def _picture_column_inner_width_px(ws, col: int) -> int:
+    letter = get_column_letter(col)
+    dim = ws.column_dimensions.get(letter)
+    wchars = float(dim.width) if dim and dim.width else float(_COLS[col - 1][1])
+    return max(24, int((wchars * 7.0 + 5.0) * 0.90))
+
+
+def _add_picture_to_cell(ws, row: int, col: int, image_path: "Path") -> int:
+    if not Path(image_path).is_file():
+        return 0
+    try:
+        xl_img = XLImage(str(image_path))
+    except Exception:
+        return 0
+    ow, oh = max(1, int(xl_img.width)), max(1, int(xl_img.height))
+    max_w = _picture_column_inner_width_px(ws, col)
+    max_h = PICTURE_MAX_HEIGHT_PX
+    scale = min(max_w / ow, max_h / oh, 1.0)
+    nw, nh = max(1, int(ow * scale)), max(1, int(oh * scale))
+    xl_img.width = nw
+    xl_img.height = nh
+    col_letter = get_column_letter(col)
+    _remove_images_at_cell(ws, row, col)
+    ws.add_image(xl_img, f"{col_letter}{row}")
+    return min(200.0, max(40.0, nh * (72.0 / 96.0) + 10.0))
+
+
+# ── Excel writer ──────────────────────────────────────────────────────────────
+
+_HDR = PatternFill("solid", start_color="1A73E8", end_color="1A73E8")
+_ALT = PatternFill("solid", start_color="EEF4FF", end_color="EEF4FF")
+_ERR = PatternFill("solid", start_color="FFE0E0", end_color="FFE0E0")
+_BRD = Border(**{s: Side(style="thin", color="D0D0D0")
+                 for s in ("left", "right", "top", "bottom")})
+_COLS = [
+    ("No.", 6),
+    ("Date", 12),
+    ("SKU", 22),
+    ("Picture", 14),
+    ("Price", 11),
+    ("Shipping", 11),
+    ("Product URL", 52),
+    ("Store name", 20),
+    ("Title", 48),
+    ("eBay price", 12),
+    ("Variation 1", 36),
+    ("Variation 2", 36),
+]
+PICTURE_COL = 4
+
+def _expand_records(records: list) -> list:
+    """
+    将含多个 sku_prices 的记录展开为多行：
+    - 第一行：完整信息，Variation 2 = 第一个变体
+    - 后续行：只填 price, shipping, eBay price, Variation 2
+    """
+    expanded = []
+    for rec in records:
+        sku_prices = rec.get("sku_prices") or []
+        variations = rec.get("variations") or {}
+        shipping = rec.get("shipping") or 0.0
+
+        if len(sku_prices) <= 1:
+            # 单变体或无变体，不展开
+            expanded.append(rec)
+            continue
+
+        # 找到变体轴（size/quantity 等，排除 color）
+        var_axis_key = None
+        for sp in sku_prices:
+            for ak in (sp.get("attrs") or {}):
+                if not re.search(r"\bcolor\b", ak, re.I):
+                    var_axis_key = ak
+                    break
+            if var_axis_key:
+                break
+
+        if not var_axis_key:
+            expanded.append(rec)
+            continue
+
+        # Variation 1 = 非变体轴属性（如 Color）
+        non_var_keys = [k for k in variations if k.lower() != var_axis_key.lower()]
+        v1_text = "\n".join(
+            f"{k}: {', '.join(variations[k]) if isinstance(variations[k], list) else variations[k]}"
+            for k in non_var_keys
+        ) if non_var_keys else ""
+
+        for i, sp in enumerate(sku_prices):
+            attrs = sp.get("attrs") or {}
+            sale = sp.get("sale_price")
+            stock = int(sp.get("stock") or 0)
+
+            # Variation 2 标签
+            var_val = attrs.get(var_axis_key, "")
+            v2_label = f"{var_axis_key}: {var_val}" if var_val else ""
+            if stock == 0:
+                v2_label += " [缺货]"
+            elif 0 < stock <= LOW_STOCK_THRESHOLD:
+                v2_label += f" [少货 only {stock} left]"
+
+            if sale is not None:
+                sale_f = float(sale)
+                ebay_p = _ebay_listing_price(sale_f, shipping)
+            else:
+                sale_f = rec.get("price") or 0.0
+                ebay_p = rec.get("ebay_price") or 0.0
+
+            if i == 0:
+                # 第一行：完整信息
+                row = dict(rec)
+                row["price"] = sale_f
+                row["ebay_price"] = ebay_p
+                row["_v1_text"] = v1_text
+                row["_v2_text"] = v2_label
+                row["_expanded"] = True
+            else:
+                # 后续行：只填关键列
+                row = {
+                    "is_variant_row": True,
+                    "_expanded": True,
+                    "seq_num": rec.get("seq_num"),
+                    "sku": "",  # 不重复写 SKU
+                    "status": rec.get("status", "OK"),
+                    "price": sale_f,
+                    "shipping": shipping,
+                    "ebay_price": ebay_p,
+                    "_v1_text": "",
+                    "_v2_text": v2_label,
+                }
+
+            expanded.append(row)
+
+    return expanded
+
+
+def _cell(ws, r, c, v, bold=False, fmt=None, wrap=False, fill=None):
+    x = ws.cell(r, c, v)
+    x.font      = Font(name="Arial", size=10, bold=bold)
+    x.alignment = Alignment(vertical="center", wrap_text=wrap)
+    x.border    = _BRD
+    if fmt:  x.number_format = fmt
+    if fill: x.fill = fill
+    return x
+
+def _save_excel(records, path):
+    path = str(path)
+    today = date.today()
+
+    def ensure_header(ws):
+        for ci, (h, w) in enumerate(_COLS, 1):
+            c = ws.cell(1, ci, h)
+            c.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+            c.fill = _HDR
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            c.border = _BRD
+            ws.column_dimensions[get_column_letter(ci)].width = w
+        ws.row_dimensions[1].height = 24
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(_COLS))}1"
+
+    def renumber_rows(ws, recs) -> None:
+        # 用 rec 里的 seq_num（如有），否则 fallback 到行号
+        rec_map = {}
+        for rc in recs:
+            sn = str(rc.get("sku") or "").strip()
+            if sn:
+                rec_map[sn] = rc.get("seq_num")
+        for r in range(2, ws.max_row + 1):
+            sku_val = str(ws.cell(r, 3).value or "").strip()
+            seq = rec_map.get(sku_val)
+            ws.cell(r, 1, seq if seq is not None else r - 1)
+
+    def existing_skus(ws) -> set[str]:
+        skus = set()
+        for r in range(2, ws.max_row + 1):
+            v = ws.cell(r, 3).value
+            if v:
+                skus.add(str(v).strip())
+        return skus
+
+    def sku_row_map(ws) -> dict[str, int]:
+        m = {}
+        for r in range(2, ws.max_row + 1):
+            v = ws.cell(r, 3).value
+            if v:
+                m[str(v).strip()] = r
+        return m
+
+    if os.path.exists(path):
+        wb = load_workbook(path)
+        ws = wb.active
+        if ws.max_row >= 1 and (ws.cell(1, 1).value or "") != "No.":
+            print(
+                "  [Excel] Old column layout detected. "
+                "Clearing sheet and applying new headers."
+            )
+            ws.delete_rows(1, ws.max_row)
+            ensure_header(ws)
+        elif ws.max_row < 1:
+            ensure_header(ws)
+        skus = existing_skus(ws)
+        row_map = sku_row_map(ws)
+        start_row = ws.max_row + 1
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Shein Products"
+        ensure_header(ws)
+        skus = set()
+        row_map = {}
+        start_row = 2
+
+    ri = start_row
+    for rec in records:
+        sku = str(rec.get("sku") or "").strip()
+        if sku and sku in row_map:
+            target_row = row_map[sku]
+        else:
+            target_row = ri
+            if sku:
+                skus.add(sku)
+                row_map[sku] = target_row
+            ri += 1
+
+        p = rec.get("price") or 0.0
+        s = rec.get("shipping") or 0.0
+        ok = rec.get("status") == "OK"
+        eb = rec.get("ebay_price")
+        if eb is None and ok:
+            eb = _ebay_listing_price(p, s)
+
+        is_variant = rec.get("is_variant_row", False)
+        is_expanded = rec.get("_expanded", False)
+
+        # 变体展开模式用 _v1_text/_v2_text，否则用旧逻辑
+        if is_expanded:
+            v1 = rec.get("_v1_text", "")
+            v2 = rec.get("_v2_text", "")
+        else:
+            v1, v2 = _split_variations_for_excel(
+                rec.get("variations") or {},
+                sku_prices=rec.get("sku_prices"),
+                shipping=s,
+            )
+
+        bg = _ERR if rec.get("status") != "OK" else (_ALT if target_row % 2 == 0 else None)
+
+        if is_variant:
+            # 变体子行：只填 price, shipping, eBay price, Variation 2
+            _cell(ws, target_row, 5, p, fmt='"$"#,##0.00', fill=bg)
+            _cell(ws, target_row, 6, s, fmt='"$"#,##0.00', fill=bg)
+            _cell(
+                ws, target_row, 10,
+                eb if ok and eb is not None else "",
+                fmt='"$"#,##0.00' if ok and eb is not None else None,
+                bold=True, fill=bg,
+            )
+            _cell(ws, target_row, 12, v2, wrap=True, fill=bg)
+            ws.row_dimensions[target_row].height = 18
+        else:
+            # 完整行：所有列
+            _cell(ws, target_row, 2, today, fmt="YYYY-MM-DD", fill=bg)
+            _cell(ws, target_row, 3, sku, fill=bg)
+            _cell(ws, target_row, PICTURE_COL, "", fill=bg)
+            _cell(ws, target_row, 5, p, fmt='"$"#,##0.00', fill=bg)
+            _cell(ws, target_row, 6, s, fmt='"$"#,##0.00', fill=bg)
+            _cell(ws, target_row, 7, rec.get("url") or rec.get("website", ""), wrap=True, fill=bg)
+            _cell(ws, target_row, 8, rec.get("store_name", ""), fill=bg)
+            _cell(ws, target_row, 9, rec.get("title", ""), wrap=True, fill=bg)
+            _cell(
+                ws, target_row, 10,
+                eb if ok and eb is not None else "",
+                fmt='"$"#,##0.00' if ok and eb is not None else None,
+                bold=True, fill=bg,
+            )
+            _cell(ws, target_row, 11, v1, wrap=True, fill=bg)
+            _cell(ws, target_row, 12, v2, wrap=True, fill=bg)
+            pic_path = rec.get("first_image_path")
+            has_pic = bool(pic_path and Path(str(pic_path)).is_file())
+            line_count = max(1, v1.count("\n") + 1, v2.count("\n") + 1)
+            base_text_pt = max(18.0, 15.0 * line_count)
+            img_pt = 0.0
+            if has_pic:
+                img_pt = float(
+                    _add_picture_to_cell(ws, target_row, PICTURE_COL, Path(str(pic_path)))
+                )
+            ws.row_dimensions[target_row].height = max(18, int(max(base_text_pt, img_pt)))
+
+    renumber_rows(ws, records)
+    wb.save(path)
+
+
+# ── Text summary + eBay title ─────────────────────────────────────────────────
+
+_STOPWORDS = {
+    "women", "womens", "men", "mens", "for", "and", "the", "a", "an", "with", "to",
+    "of", "in", "on", "by", "from", "shop", "online", "fashion"
+}
+
+
+def _clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _make_ebay_title(original_title: str, variations: dict, max_len: int = 80) -> str:
+    """
+    生成更优质的 eBay 标题（<=80字符）。
+    策略：保留全部有意义的关键词，去重去噪，按空间决定是否加 NEW / FREE SHIPPING。
+    """
+    t = _clean_ws(original_title)
+    if not t:
+        return ""
+
+    # 1) 提取颜色
+    color = ""
+    if isinstance(variations, dict):
+        for k in variations.keys():
+            if "color" in (k or "").lower():
+                vals = variations.get(k) or []
+                if isinstance(vals, list) and vals:
+                    color = _clean_ws(str(vals[0]))
+                break
+
+    # 2) 去掉标题中的噪声词和重复词，保留有意义的关键词
+    noise = _STOPWORDS | {
+        "shein", "sheglam", "local", "pcs", "set", "pack", "suitable",
+        "style", "type", "series", "material", "product", "item", "items",
+        "home", "decor", "decoration", "room", "living", "bedroom",
+    }
+    words = re.findall(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*", t)
+    kept = []
+    seen = set()
+    for w in words:
+        lw = w.lower()
+        if lw in noise and len(lw) <= 5:
+            continue
+        if lw in seen:
+            continue
+        seen.add(lw)
+        # 纯数字保留（如尺寸 "21" "145cm"）
+        kept.append(w.capitalize() if w.islower() else w)
+
+    core = " ".join(kept)
+
+    # 3) 如果颜色不在标题中，追加
+    if color and color.lower() not in core.lower():
+        core = f"{core} {color}"
+
+    # 4) 根据剩余空间决定是否加 NEW / FREE SHIPPING
+    tag_free = " FREE SHIPPING"
+    tag_new = "NEW "
+    budget = max_len
+
+    # 尝试：NEW + core + FREE SHIPPING
+    full = f"{tag_new}{core}{tag_free}"
+    if len(full) <= budget:
+        return full
+
+    # 尝试：core + FREE SHIPPING
+    mid = f"{core}{tag_free}"
+    if len(mid) <= budget:
+        return mid
+
+    # 尝试：NEW + core
+    mid2 = f"{tag_new}{core}"
+    if len(mid2) <= budget:
+        return mid2
+
+    # 只保留 core，截断到 80 字符
+    if len(core) <= budget:
+        return core
+
+    # 截断到单词边界
+    truncated = core[:budget + 1]
+    if " " in truncated:
+        truncated = truncated.rsplit(" ", 1)[0]
+    return truncated.strip(" -,")
+
+
+def _safe_filename(s: str) -> str:
+    s = _clean_ws(s)
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", s)
+    return s[:120] if len(s) > 120 else s
+
+
+def _write_ebay_listing_txt(rec: dict, media_folder) -> "Path | None":
+    sku = rec.get("sku") or ""
+    if not sku or media_folder is None or not Path(media_folder).is_dir():
+        return None
+
+    original_title = _clean_ws(rec.get("original_title", rec.get("title", "")))
+    ebay_price = rec.get("ebay_price", "")
+    variations = rec.get("variations") or {}
+    sku_prices = rec.get("sku_prices") or []
+    ebay_title = _make_ebay_title(original_title, variations)
+
+    if isinstance(ebay_price, (int, float)):
+        ep_line = f"eBay价格: ${float(ebay_price):.2f}"
+    else:
+        ep_line = f"eBay价格: {ebay_price}"
+
+    lines = [
+        f"希音原标题: {original_title}",
+        f"eBay标题: {ebay_title}",
+        ep_line,
+    ]
+
+    # 变体信息（含每个 size 的价格）
+    if isinstance(variations, dict) and variations:
+        lines.append("")
+        lines.append("变体:")
+        for k, v in variations.items():
+            if isinstance(v, list):
+                lines.append(f"- {k}: {', '.join(map(str, v))}")
+            else:
+                lines.append(f"- {k}: {v}")
+
+    # 每个 SKU 变体的价格明细
+    if sku_prices:
+        lines.append("")
+        lines.append("各变体价格:")
+        for sp in sku_prices:
+            attrs = sp.get("attrs") or {}
+            sale = sp.get("sale_price")
+            stock = int(sp.get("stock") or 0)
+            if sale is None:
+                continue
+            sale_f = float(sale)
+            shipping = rec.get("shipping") or 0.0
+            ebay_var = _ebay_listing_price(sale_f, shipping)
+            attr_str = ", ".join(f"{k}: {v}" for k, v in attrs.items() if v)
+            if stock == 0:
+                stock_note = " [缺货]"
+            elif 0 < stock <= LOW_STOCK_THRESHOLD:
+                stock_note = f" [少货 only {stock} left]"
+            else:
+                stock_note = ""
+            lines.append(f"  {attr_str} → eBay${ebay_var:.2f}{stock_note}")
+
+    out_path = Path(media_folder) / EBAY_LISTING_TXT_NAME
+    out_path.write_text("\n".join(lines) + "\n", encoding=OUTPUT_ENCODING)
+    return out_path
+
+
+# ── Media downloader ──────────────────────────────────────────────────────────
+
+_DL_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Referer": "https://us.shein.com/",
+}
+
+
+def _guess_ext(url: str, content_type: "str | None") -> str:
+    path = urlparse(url).path
+    ext = Path(unquote(path)).suffix.lower()
+    if ext and len(ext) <= 6:
+        return ext
+    if content_type:
+        ct = content_type.split(";")[0].strip().lower()
+        return {
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+            "video/mp4": ".mp4",
+            "application/vnd.apple.mpegurl": ".m3u8",
+            "application/x-mpegurl": ".m3u8",
+        }.get(ct, "")
+    return ""
+
+
+def _download_one(
+    url: str,
+    dest: "Path",
+    timeout: int = 45,
+    headers: "dict | None" = None,
+    retries: int = 3,
+) -> bool:
+    hdr = {**_DL_HEADERS, **(headers or {})}
+    for attempt in range(retries):
+        try:
+            with requests.get(url, headers=hdr, stream=True, timeout=timeout) as r:
+                r.raise_for_status()
+                ct = (r.headers.get("content-type") or "").lower()
+                if ct.startswith("text/") or "text/html" in ct:
+                    return False
+
+                ext = _guess_ext(url, ct)
+                final = dest.with_suffix(ext or dest.suffix)
+                tmp = final.with_suffix((final.suffix or "") + ".part")
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 256):
+                        if chunk:
+                            f.write(chunk)
+
+                size = tmp.stat().st_size
+                is_image = ct.startswith("image/")
+                is_video = ct.startswith("video/") or any(
+                    (final.suffix or "").lower() == x for x in (".mp4", ".m3u8")
+                )
+                if is_image and size < 20_000:
+                    tmp.unlink(missing_ok=True)
+                    return False
+                if is_video and size < 150_000:
+                    tmp.unlink(missing_ok=True)
+                    return False
+
+                tmp.replace(final)
+            return True
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(1.0 + attempt * 0.5)
+    return False
+
+
+def _is_shein_webp_asset_url(u: str) -> bool:
+    if not isinstance(u, str) or not u.startswith("http"):
+        return False
+    ul = u.lower()
+    if not any(
+        x in ul
+        for x in ("ltwebstatic.com", "sheingroup", "img.shein.com", ".shein.com/", "shein.com/")
+    ):
+        return False
+    if any(
+        x in ul
+        for x in ("sprite", "icon", "logo", "avatar", "badge", "emoji", "payment", "banner", "_ad_", "promo-badge")
+    ):
+        return False
+    path_only = ul.split("?")[0]
+    if path_only.endswith((".jpg", ".jpeg", ".png", ".gif")):
+        return False
+    is_webp = (
+        path_only.endswith(".webp")
+        or ".webp?" in ul
+        or "format=webp" in ul
+        or "format,webp" in ul
+        or re.search(r"(?:^|[?&])type=webp(?:$|&)", ul) is not None
+    )
+    if not is_webp:
+        return False
+    if re.search(r"\b(50|64|72|80|96|100)x(50|64|72|80|96|100)\b", ul):
+        return False
+    return True
+
+
+def _webp_url_size_score(u: str) -> int:
+    ul = (u or "").lower()
+    s = 0
+    for m in re.finditer(r"\b(\d{2,4})x(\d{2,4})\b", ul):
+        a, b = int(m.group(1)), int(m.group(2))
+        s = max(s, a * b)
+    try:
+        qs = parse_qs(urlparse(u).query)
+        for key in ("imwidth", "width", "w"):
+            if key in qs and qs[key]:
+                w = int(qs[key][0])
+                s = max(s, w * w)
+                break
+    except (ValueError, TypeError):
+        pass
+    return s * 10_000 + len(u)
+
+
+_SHEIN_THUMB_W_RE = re.compile(r"_thumbnail_(\d{3,4})(?=[._/])", re.I)
+_SHEIN_THUMB_WH_RE = re.compile(
+    r"_(square_thumbnail|thumbnail)_(\d{3,4})x(\d{3,4})(?=[._/])", re.I,
+)
+
+
+def _shein_upgrade_webp_to_large(u: str) -> str:
+    try:
+        p = urlparse(u)
+        path = p.path
+
+        def _bump_thumb_wh(m: re.Match) -> str:
+            kind, w, h = m.group(1), int(m.group(2)), int(m.group(3))
+            if w < 1 or h < 1:
+                return m.group(0)
+            nw = max(w, 1200)
+            nh = max(h, int(round(nw * h / w)))
+            return f"_{kind}_{nw}x{nh}"
+
+        def _bump_thumb(m: re.Match) -> str:
+            n = int(m.group(1))
+            if n >= 900:
+                return m.group(0)
+            return f"_thumbnail_{max(n, 1050)}"
+
+        path = _SHEIN_THUMB_WH_RE.sub(_bump_thumb_wh, path)
+        path = _SHEIN_THUMB_W_RE.sub(_bump_thumb, path)
+        q = parse_qs(p.query, keep_blank_values=True)
+        host = (p.netloc or "").lower()
+        if "ltwebstatic" in host or "shein" in host or "sheingroup" in host:
+            q["imwidth"] = ["1340"]
+        pairs = [(k, v) for k, vs in q.items() for v in vs]
+        new_q = urlencode(pairs) if pairs else ""
+        return urlunparse((p.scheme, p.netloc, path, p.params, new_q, p.fragment))
+    except Exception:
+        return u
+
+
+def _shein_webp_passes_large_rule(u: str) -> bool:
+    ul = (u or "").lower()
+    m = _SHEIN_THUMB_W_RE.search(ul)
+    if m:
+        return int(m.group(1)) >= 600
+    edge = 0
+    for mm in re.finditer(r"\b(\d{2,4})x(\d{2,4})\b", ul):
+        a, b = int(mm.group(1)), int(mm.group(2))
+        edge = max(edge, min(a, b))
+    try:
+        qs = parse_qs(urlparse(u).query)
+        for key in ("imwidth", "width", "w"):
+            if key in qs and qs[key]:
+                edge = max(edge, int(qs[key][0]))
+                break
+    except (ValueError, TypeError, IndexError):
+        pass
+    if edge == 0:
+        return True
+    return edge >= 480
+
+
+def _download_media(rec: dict, base_dir: "Path", seq_num: "int | None" = None) -> "Path | None":
+    """
+    改进版媒体下载：
+    1. 优先使用 goods_imgs（从 JSON 解析的有序主图）
+    2. 并行下载（ThreadPoolExecutor）
+    3. 文件夹以 seq_num 命名（如 "26"），无 seq 时回退到 SKU
+    """
+    sku = rec.get("sku") or ""
+    media = rec.get("media") or {}
+    goods_imgs = rec.get("goods_imgs") or []
+    if not sku or not isinstance(media, dict):
+        return None
+
+    if seq_num is not None:
+        folder = Path(base_dir) / str(seq_num)
+    else:
+        folder = Path(base_dir) / f"{MEDIA_FOLDER_PREFIX}{_safe_filename(sku)}"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for p in folder.iterdir():
+            if p.is_file():
+                p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    images = media.get("images") or []
+    videos = media.get("videos") or []
+    if not isinstance(images, list):
+        images = []
+    if not isinstance(videos, list):
+        videos = []
+
+    page_url = (rec.get("url") or "").strip()
+    dl_headers = {}
+    if page_url:
+        dl_headers["Referer"] = page_url
+
+    # ── 优先：goods_imgs 中的图片（有序，直接来自 JSON，无需过滤）──
+    priority_urls = []
+    if goods_imgs:
+        for u in goods_imgs:
+            if not isinstance(u, str) or not u.startswith("http"):
+                continue
+            u2 = _shein_upgrade_webp_to_large(u)
+            priority_urls.append(u2)
+        print(f"  [图片] goods_imgs 解析到 {len(priority_urls)} 张主图")
+
+    # ── 备选：DOM 扫描图片（过滤 + 升级）──
+    fallback_urls = []
+    for u in images:
+        if not isinstance(u, str) or not _is_shein_webp_asset_url(u):
+            continue
+        u2 = _shein_upgrade_webp_to_large(u)
+        if _shein_webp_passes_large_rule(u2):
+            fallback_urls.append(u2)
+    fallback_urls.sort(key=_webp_url_size_score, reverse=True)
+    fallback_urls = fallback_urls[:120]
+
+    # 当 goods_imgs 有结果时，只用它（准确的商品主图），不混入 DOM 图片
+    # 仅当 goods_imgs 为空时才用 DOM fallback
+    if priority_urls:
+        img_urls = priority_urls
+    else:
+        img_urls = fallback_urls
+        print(f"  [图片] goods_imgs 为空，使用 DOM fallback ({len(fallback_urls)} 张)")
+
+    # ── 并行下载图片 ──
+    downloaded_images: list[Path] = []
+    download_lock = threading.Lock()
+
+    def dl_img(idx_url):
+        idx, u = idx_url
+        name = folder / f"_dl_img_{idx:04d}"
+        if _download_one(u, name, timeout=55, headers=dl_headers, retries=3):
+            candidates = [p for p in folder.glob(name.name + ".*") if p.suffix != ".part"]
+            if candidates:
+                best = max(candidates, key=lambda p: p.stat().st_size)
+                with download_lock:
+                    downloaded_images.append((idx, best))
+                return True
+        return False
+
+    with ThreadPoolExecutor(max_workers=IMAGE_DOWNLOAD_WORKERS) as executor:
+        list(executor.map(dl_img, enumerate(img_urls)))
+
+    # 按原始顺序排列（priority 图片在前保持顺序）
+    downloaded_images.sort(key=lambda x: x[0])
+    ordered_paths = [p for _, p in downloaded_images]
+
+    # goods_imgs 来自 JSON 解析，是精确匹配，放宽文件大小限制
+    use_priority = bool(priority_urls)
+    MIN_WEBP_BYTES = 30_000 if use_priority else 80_000
+    MIN_WEBP_FALLBACK = 10_000 if use_priority else 35_000
+
+    webp_files = [
+        p for p in ordered_paths if p.suffix.lower() == ".webp" and p.is_file()
+    ]
+
+    large_w = [p for p in webp_files if p.stat().st_size >= MIN_WEBP_BYTES]
+    if not large_w:
+        large_w = [p for p in webp_files if p.stat().st_size >= MIN_WEBP_FALLBACK]
+
+    keep_set = set(large_w)
+
+    if not keep_set and webp_files:
+        tiny = [p for p in webp_files if p.stat().st_size >= 5_000]
+        tiny.sort(key=lambda p: p.stat().st_size, reverse=True)
+        if tiny:
+            keep_set = set(tiny[:25])
+        else:
+            best = max(webp_files, key=lambda p: p.stat().st_size)
+            if best.stat().st_size >= 3_000:
+                keep_set = {best}
+
+    # 保留 keep_set，按下载顺序排
+    kept_ordered = [p for p in ordered_paths if p in keep_set]
+    # 删除其余临时文件
+    for p in ordered_paths:
+        if p not in keep_set:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    for i, p in enumerate(kept_ordered, start=1):
+        newp = folder / f"img_{i:03d}.webp"
+        if p.resolve() != newp.resolve():
+            try:
+                if newp.exists():
+                    newp.unlink(missing_ok=True)
+                p.replace(newp)
+            except Exception:
+                try:
+                    shutil.copy2(p, newp)
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    # ── 视频下载（串行，通常只有 1–2 个）──
+    mp4_urls = [u for u in videos if isinstance(u, str) and ".mp4" in u.lower()]
+    downloaded_videos: list[Path] = []
+    for idx, u in enumerate(mp4_urls):
+        name = folder / f"_dl_vid_{idx:04d}"
+        if _download_one(u, name, timeout=120, headers=dl_headers, retries=3):
+            candidates = [p for p in folder.glob(name.name + ".*") if p.suffix != ".part"]
+            if candidates:
+                downloaded_videos.append(max(candidates, key=lambda p: p.stat().st_size))
+
+    downloaded_videos.sort(key=lambda p: p.stat().st_size, reverse=True)
+    for i, p in enumerate(downloaded_videos, start=1):
+        final = folder / f"video_{i:03d}.mp4"
+        if p.resolve() != final.resolve():
+            try:
+                if final.exists():
+                    final.unlink(missing_ok=True)
+                p.replace(final)
+            except Exception:
+                try:
+                    shutil.copy2(p, final)
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    return folder
+
+
+# ── Public function ───────────────────────────────────────────────────────────
+
+def scrape_shein(urls, output="shein_products.xlsx", start_seq=1):
+    """
+    抓取一个或多个 Shein 商品 URL，保存到 Excel。
+
+    Parameters
+    ----------
+    urls      : str | list[str]
+    output    : str               输出 .xlsx 文件名
+    start_seq : int               Excel 第一列序号起始值
+    """
+    if isinstance(urls, str):
+        urls = [urls]
+
+    print("Launching Chrome...")
+    chrome_proc, profile_dir, launched_new = _ensure_chrome()
+    if launched_new:
+        print(f"Chrome ready (PID {chrome_proc.pid})  —  scraping {len(urls)} URL(s)\n")
+    else:
+        print(f"Chrome ready (existing session)  —  scraping {len(urls)} URL(s)\n")
+
+    records = []
+    try:
+        for i, url in enumerate(urls, 1):
+            print(f"[{i}/{len(urls)}] {url[:80]}...")
+            rec = {"url": url, "status": "OK"}
+            tab_id = None
+            _url_start_time = time.monotonic()
+            try:
+                print("  navigating...")
+                ws_url, tab_id = _navigate_and_wait(CDP_PORT, url)
+
+                # 检测登录/验证码拦截
+                base_dir = Path.cwd()
+                if not _check_and_handle_block(CDP_PORT, tab_id, url, base_dir):
+                    rec["status"] = "BLOCKED"
+                    print("  [跳过] 页面被拦截，无法提取")
+                    records.append(rec)
+                    if tab_id is not None:
+                        _close_tab(CDP_PORT, tab_id)
+                    if i < len(urls):
+                        time.sleep(DELAY_BETWEEN_PAGES)
+                    continue
+
+                # 滚动触发懒加载，稍等片刻
+                try:
+                    _run_js(ws_url, _JS_SCROLL_GALLERY)
+                    time.sleep(1.0)
+                    ws_url = _ws_url_for_id(CDP_PORT, tab_id)
+                except Exception:
+                    pass
+
+                data = None
+                for attempt in range(PAGE_LOAD_RETRIES):
+                    # 超时保护：如果单个页面总耗时超过 EXTRACTION_TIMEOUT_SEC
+                    _elapsed = time.monotonic() - _url_start_time
+                    if _elapsed > EXTRACTION_TIMEOUT_SEC:
+                        print(f"  [超时] 页面处理已超过 {EXTRACTION_TIMEOUT_SEC}s，可能被隐形拦截")
+                        # 二次验证码检测
+                        _recheck = None
+                        try:
+                            ws_url = _ws_url_for_id(CDP_PORT, tab_id)
+                            _recheck = _run_js(ws_url, _JS_DETECT_BLOCK)
+                        except Exception:
+                            pass
+                        # 无论是否检测到验证码，都截图通知
+                        ss_path = str(Path(base_dir) / "_timeout_screenshot.png")
+                        try:
+                            ws_url = _ws_url_for_id(CDP_PORT, tab_id)
+                            _take_screenshot(ws_url, ss_path)
+                        except Exception:
+                            ss_path = None
+                        _block_info = ""
+                        if isinstance(_recheck, dict) and _recheck.get("blocked"):
+                            _block_info = f"\n检测到拦截类型: {_recheck.get('type', 'unknown')}"
+                        alert_generic(
+                            url,
+                            f"页面处理超时（{_elapsed:.0f}s > {EXTRACTION_TIMEOUT_SEC}s），"
+                            f"可能存在隐形验证码或页面加载异常。{_block_info}",
+                            screenshot_path=ss_path,
+                        )
+                        rec["status"] = "TIMEOUT"
+                        data = None
+                        break
+
+                    print("  extracting...")
+                    data = _run_js(ws_url, _JS)
+                    if isinstance(data, dict) and not _shein_page_needs_retry(data):
+                        break
+                    if attempt < PAGE_LOAD_RETRIES - 1:
+                        print(
+                            f"  transient/error page (try {attempt + 1}/{PAGE_LOAD_RETRIES}), "
+                            "reloading..."
+                        )
+                        time.sleep(RELOAD_PAUSE_SEC)
+                        ws_url = _reload_tab_and_wait(CDP_PORT, tab_id)
+
+                if rec.get("status") == "TIMEOUT":
+                    print("  [跳过] 页面超时")
+                    records.append(rec)
+                    if tab_id is not None:
+                        _close_tab(CDP_PORT, tab_id)
+                    if i < len(urls):
+                        time.sleep(DELAY_BETWEEN_PAGES)
+                    continue
+
+                if not isinstance(data, dict):
+                    raise ValueError("JS returned unexpected type — page may not have loaded")
+
+                shipping = _calc_shipping(data)
+                price    = data.get("price") or 0.0
+                ebay     = _ebay_listing_price(price, shipping)
+                thresh   = data.get("free_threshold")
+
+                ship_note = (
+                    f"threshold=${thresh:.2f} — price ${price:.2f} "
+                    f"{'≥ threshold → FREE' if price >= thresh else '< threshold → $' + str(DEFAULT_SHIPPING_FEE)}"
+                    if thresh is not None else
+                    "unconditional FREE" if data.get("unconditional_free") else
+                    f"no shipping info → default ${DEFAULT_SHIPPING_FEE}"
+                )
+
+                sku_prices = data.get("sku_prices") or []
+                rec.update({
+                    "sku":            data.get("goods_sn") or data.get("goods_id", ""),
+                    "price":          price,
+                    "shipping":       shipping,
+                    "website":        "us.shein.com",
+                    "store_name":     data.get("store_name", ""),
+                    "original_title": data.get("title", ""),
+                    "title":          data.get("title", ""),
+                    "variations":     data.get("variations", {}),
+                    "ebay_price":     ebay,
+                    "media":          data.get("media", {}),
+                    "goods_imgs":     data.get("goods_imgs") or [],
+                    "sku_prices":     sku_prices,
+                    "seq_num":        start_seq + (i - 1),
+                })
+
+                # 如果颜色是单一选中值，追加到标题
+                try:
+                    vars_ = rec.get("variations") or {}
+                    color_key = next((k for k in vars_.keys() if "color" in (k or "").lower()), None)
+                    if color_key:
+                        cv = vars_.get(color_key) or []
+                        if isinstance(cv, list) and len(cv) == 1:
+                            color_val = _clean_ws(str(cv[0]))
+                            if color_val and color_val.lower() not in (rec["title"] or "").lower():
+                                rec["title"] = _clean_ws(f"{rec['title']} - {color_val}")
+                except Exception:
+                    pass
+                if not rec["title"]:
+                    rec["status"] = "PARSE_ERROR"
+
+                seq = rec["seq_num"]
+                goods_imgs_count = len(rec.get("goods_imgs") or [])
+                print(f"  seq        : {seq}")
+                print(f"  title      : {rec['title'][:65]}")
+                print(f"  sku        : {rec['sku']}")
+                print(f"  price      : ${price:.2f}")
+                print(f"  shipping   : ${shipping:.2f}  ({ship_note})")
+                print(f"  store      : {rec['store_name']}")
+                print(f"  eBay price : ${ebay:.2f}")
+                print(f"  variations : {rec['variations']}")
+                print(f"  sku_prices : {len(sku_prices)} 个变体")
+                print(f"  goods_imgs : {goods_imgs_count} 张（JSON解析）")
+
+                base_dir = Path.cwd()
+                media_folder = _download_media(rec, base_dir, seq_num=seq)
+                _write_ebay_listing_txt(rec, media_folder)
+                first_img = _first_product_image_path(media_folder)
+                rec["first_image_path"] = str(first_img) if first_img else ""
+                if media_folder:
+                    n_webp = len(list(Path(media_folder).glob("img_*.webp")))
+                    n_img  = len(list(Path(media_folder).glob("img_*.*")))
+                    n_vid  = len(list(Path(media_folder).glob("video_*.mp4")))
+                    print(f"  media      : {n_img} image(s) ({n_webp} webp), {n_vid} video(s)")
+
+            except Exception as e:
+                rec["status"] = f"ERROR: {e}"
+                print(f"  ERROR: {e}")
+            finally:
+                # 关闭用完的标签页（保持 Chrome 整洁）
+                if tab_id is not None:
+                    _close_tab(CDP_PORT, tab_id)
+
+            records.append(rec)
+            if i < len(urls):
+                time.sleep(DELAY_BETWEEN_PAGES)
+
+    finally:
+        if launched_new and chrome_proc is not None and not KEEP_CHROME_OPEN:
+            chrome_proc.terminate()
+            print("\nChrome closed.")
+        elif launched_new and chrome_proc is not None and KEEP_CHROME_OPEN:
+            print("\nChrome left running (persistent session).")
+        else:
+            print("\nChrome left running (reused existing session).")
+
+    expanded = _expand_records(records)
+    _save_excel(expanded, output)
+    print(f"\nSaved to '{output}'  ({len(expanded)} row(s), from {len(records)} product(s))")
+    return records
