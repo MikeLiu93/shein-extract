@@ -1,0 +1,64 @@
+# Shein Product Scraper - CHANGELOG
+
+## v2.5 — 2026-04-16
+- **本地 Dashboard**: 新增 `dashboard.py`（stdlib 零依赖，端口 5055），自动刷新 3s，显示健康徽章（OK/WARN/DEAD）、当前 txt 文件、URL 进度条 x/y、最近 8 条事件、最新 debug log 尾部 25 行
+- **卡住判定**: 心跳 >60s 黄色 WARN，>5min 红色 DEAD；PID 死掉直接 DEAD
+- **心跳/事件模块**: 新增 `state_tracker.py`，原子写 `state/state.json` + append `state/events.jsonl`
+- **Worker 插桩**: `take_orders_worker.py` 在 start/stop/set_file/file_done/error/idle 六处发心跳
+- **Scraper URL 级进度**: `shein_scraper.py` 每个 URL 开始时上报 `done/total/current_url`，graceful import（无 state_tracker 也能跑）
+- **一键启动**: 新增 `run_dashboard.cmd`
+- **备份**: `shein_scraper.py.bak.20260416` 为本次修改前备份
+
+## v2.4 — 2026-04-11
+- **周报合并脚本** (`merge_store_reports.py`): 按员工+店铺合并 shein_products Excel，去重（按 No. 列），图片从磁盘 seq 文件夹直接插入确保位置正确
+- **严格周日期过滤**: 只合并当周（周一~周日）的文件夹，避免跨周重复。支持 `--week YYYYMMDD` 指定周、`--all` 合并全部
+- **文件命名**: `shein_products_{store}_{weekrange}_{seqrange}_merged.xlsx`
+- **每周自动运行**: 定时任务 `SheinListing-WeeklyMerge`，每周日 23:00 自动合并所有员工所有店铺
+
+## v2.3 — 2026-04-09 ~ 2026-04-10
+- **2026-04-10 修复**: rollback 误用旧备份导致 `RateLimitError` 等 v2.3 功能丢失，定时任务 `--once` 无法启动。已全部恢复并更新备份为 `shein_scraper.py.bak.20260410`
+- **Retry 序号保留**: `_retry.txt` 记录原始 seq 号，retry 时用 `seq_list` 传入，媒体文件夹按原始序号命名（如 25, 28）
+- **Retry 文件夹去重**: 媒体文件夹已存在时自动加 `-2` 后缀（如 `25-2`）
+- **Retry 独立 Excel**: retry 结果写入 "2nd run" Excel，不覆盖原始表格
+- **限流自动检测**: 连续 3 个 URL 失败自动判定限流，停止当前批次，等待 2 小时后自动继续剩余文件
+- **页面超时提高**: EXTRACTION_TIMEOUT_SEC 从 120s 提高到 240s（4 分钟）
+- **Stock 列 (col 14)**: 新增库存列，显示具体数量；缺货显示"缺货"，少货显示"少货 only X left"
+- **变体 SKU 修正**: 变体子行 C 列改用 `mainSaleAttribute` 的 `goods_sn`（与商品 SKU 格式一致），不再使用内部 `sku_code`
+- **mainSaleAttribute 提取**: JS 新增从 `gbRawData.modules.saleAttr.mainSaleAttribute` 提取颜色变体对应的独立 goods_sn
+- **Retry 机制**: 失败的 URL 记录到输出文件夹 `_retry.txt`，`--retry` 模式只重跑失败项，原地更新已有 Excel
+- **Excel URL 匹配**: `_save_excel` 支持通过 URL 列匹配覆盖错误占位行，retry 不再产生 -2/-3 重复文件夹
+- **定时任务自动 retry**: `run_scheduled.cmd` 在 `--once` 之后自动运行 `--retry`
+- **processed 员工分流**: 处理完的 txt 文件也按员工代号分流到子文件夹
+
+## v2.2 — 2026-04-08
+- **图片插入修复**: 安装 Pillow 依赖，Excel 中图片现在正常嵌入
+- **Variant SKU 改到 C 列**: 变体子行的 SKU 列 (C) 直接显示该变体的 sku_code，取消独立 Variant SKU 列
+- **eBay Title 列 (col 13)**: 自动生成的 eBay 上架标题（从 col 14 调整到 col 13）
+- **员工分流输出**: completed 和 processed 文件夹按员工代号 (NA/TT/YAN/ZQW/LUMEI) 自动分流到子文件夹
+- **move_file 容错**: 源文件已被 Google Drive 同步移走时不再崩溃，跳过并继续处理后续文件
+- **定时任务更新**: 触发时间改为每天 14:00 和 20:00，脚本路径指向新项目目录
+- **项目清理**: 删除旧测试文件、调试脚本、缓存，精简项目结构
+
+## v2.1 — 2026-04-07
+- **单值变体也显示**: 即使某个属性只有一个值（如 Size: Double），也会出现在 Variation 列
+- **变体子行 No. 留空**: 同一商品的多个变体行，第一行保留编号，后续行 No. 列为空
+- **变体子行 V1 也填充**: 之前变体子行只填 V2，现在 V1/V2 都填各自的具体值
+- **variations 自动补全**: 从 sku_prices attrs 补充页面 JS 提取遗漏的变体属性
+- **eBay Title**: 自动生成的 eBay 上架标题写入 Excel
+- **Rollback**: `shein_scraper.py.bak.20260407` 为修改前备份
+
+## v2.0 — 2026-03-31 ~ 2026-04-04 (Initial commit)
+- Chrome CDP 远程调试协议抓取 Shein 商品数据
+- 智能等待页面就绪（轮询 goods_sn，替代固定 sleep）
+- 并行图片下载（ThreadPoolExecutor，8 线程）
+- goods_imgs JSON 解析：从页面内嵌 JSON 提取有序主图
+- 页面滚动触发懒加载
+- 关闭用完标签页，避免 Chrome 堆积
+- 验证码/登录弹窗检测与自动重试
+- 超时保护 + 邮件通知
+- Excel 输出：12 列（No./Date/SKU/Picture/Price/Shipping/URL/Store/Title/eBay price/V1/V2）
+- 变体展开：多 SKU 商品按变体展开为多行，含库存标注
+- eBay 上架资料 TXT 自动生成（标题/价格/变体明细）
+- 媒体下载：商品图片 + 视频，自动过滤/去重/升级分辨率
+- take_orders_worker：从 Google Drive submitted 文件夹自动取单处理
+- 定时任务支持（Windows Task Scheduler）

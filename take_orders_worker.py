@@ -20,7 +20,8 @@ from datetime import datetime
 from pathlib import Path
 import re
 
-from shein_scraper import scrape_shein
+from shein_scraper import scrape_shein, RateLimitError
+import state_tracker
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -48,6 +49,7 @@ class _TeeIO:
         for s in self._streams:
             try:
                 s.write(data)
+                s.flush()
             except Exception:
                 pass
         try:
@@ -144,6 +146,25 @@ def _parse_store_and_seq_label(name: str) -> str:
     return ""
 
 
+_KNOWN_EMPLOYEES = {"NA", "TT", "YAN", "ZQW", "LUMEI"}
+
+
+def _parse_employee_code(name: str) -> str:
+    """
+    从文件名提取员工代号（第二段）。
+    '20260403 - YAN - B4 - 64-80' → 'YAN'
+    '20260403- LUMEI-Z3-24-43' → 'LUMEI'
+    返回匹配的员工代号，或空字符串。
+    """
+    clean = re.sub(r'^\d{8}\s*[-–]?\s*', '', name).strip()
+    parts = re.split(r'\s*[-–]\s*', clean)
+    if parts:
+        candidate = parts[0].strip().upper()
+        if candidate in _KNOWN_EMPLOYEES:
+            return candidate
+    return ""
+
+
 def _safe_name(name: str) -> str:
     name = (name or "").strip()
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
@@ -177,7 +198,12 @@ def process_order_file(txt_path: Path) -> tuple[bool, str]:
     if not urls:
         return False, "No valid URL lines found in txt."
 
-    run_dir = unique_output_folder(OUTPUT_ROOT, txt_path.stem)
+    state_tracker.set_file(txt_path.name, total_urls=len(urls))
+
+    employee = _parse_employee_code(txt_path.stem)
+    out_root = OUTPUT_ROOT / employee if employee else OUTPUT_ROOT
+    out_root.mkdir(parents=True, exist_ok=True)
+    run_dir = unique_output_folder(out_root, txt_path.stem)
     try:
         shutil.copy2(txt_path, run_dir / txt_path.name)
     except OSError as e:
@@ -218,6 +244,9 @@ def process_order_file(txt_path: Path) -> tuple[bool, str]:
 
 
 def move_file(src: Path, dest_dir: Path) -> Path:
+    if not src.exists():
+        logger.warning("Source file already gone (Drive sync?): %s", src)
+        return dest_dir / src.name
     dest = dest_dir / src.name
     if not dest.exists():
         return src.replace(dest)
@@ -244,12 +273,20 @@ def run_batch_once() -> int:
         try:
             ok, msg = process_order_file(txt)
             if ok:
-                move_file(txt, PROCESSED_DIR)
+                emp = _parse_employee_code(txt.stem)
+                proc_dest = PROCESSED_DIR / emp if emp else PROCESSED_DIR
+                proc_dest.mkdir(parents=True, exist_ok=True)
+                move_file(txt, proc_dest)
                 logger.info("Done. Output folder: %s", msg)
             else:
                 any_fail = True
                 move_file(txt, FAILED_DIR)
                 logger.warning("Failed: %s", msg)
+        except RateLimitError:
+            logger.warning("[限流] Shein 限流检测触发，当前文件已保存已完成部分。")
+            logger.info("[限流] 等待 2 小时后自动继续剩余文件...")
+            time.sleep(7200)
+            logger.info("[限流] 2 小时已到，继续处理...")
         except Exception as e:
             any_fail = True
             logger.exception("Error processing %s: %s", txt.name, e)
@@ -262,12 +299,93 @@ def run_batch_once() -> int:
     return 1 if any_fail else 0
 
 
+def run_retry() -> int:
+    """
+    扫描 completed 文件夹中的 _retry.txt，只重跑失败的 URL，原地更新已有 Excel。
+    """
+    retry_files = list(OUTPUT_ROOT.rglob("_retry.txt"))
+    if not retry_files:
+        logger.info("[Retry] No _retry.txt found — nothing to retry.")
+        return 0
+
+    logger.info("[Retry] Found %d folder(s) with _retry.txt", len(retry_files))
+    any_fail = False
+    old_cwd = Path.cwd()
+    old_out, old_err = sys.stdout, sys.stderr
+    scrape_log_append = None
+
+    for retry_path in retry_files:
+        run_dir = retry_path.parent
+        logger.info("[Retry] Processing: %s", run_dir.name)
+
+        # 读取失败 URL
+        lines = retry_path.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
+        retry_urls = []
+        retry_seqs = []
+        for line in lines:
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                seq = int(parts[0]) if parts[0].isdigit() else 1
+                url = parts[2].strip()
+                if url.startswith("http"):
+                    retry_urls.append(url)
+                    retry_seqs.append(seq)
+
+        if not retry_urls:
+            logger.info("[Retry] No valid URLs in %s, removing.", retry_path)
+            retry_path.unlink(missing_ok=True)
+            continue
+
+        # 找到原始 xlsx，生成 "2nd run" 文件名
+        xlsx_files = list(run_dir.glob("*.xlsx"))
+        if not xlsx_files:
+            logger.warning("[Retry] No .xlsx found in %s, skipping.", run_dir)
+            continue
+        orig_name = xlsx_files[0].stem
+        retry_xlsx = f"{orig_name} 2nd run.xlsx"
+
+        logger.info("[Retry] %d failed URL(s) (seq: %s), output: %s",
+                     len(retry_urls), retry_seqs, retry_xlsx)
+
+        try:
+            import os
+            os.chdir(run_dir)
+            if _RUN_LOG_PATH is not None:
+                scrape_log_append = open(_RUN_LOG_PATH, "a", encoding="utf-8")
+                scrape_log_append.write(f"\n--- retry scrape_shein: {run_dir.name} ---\n")
+                scrape_log_append.flush()
+                sys.stdout = _TeeIO(old_out, scrape_log_append)
+                sys.stderr = _TeeIO(old_err, scrape_log_append)
+
+            scrape_shein(retry_urls, output=retry_xlsx, seq_list=retry_seqs)
+        except Exception as e:
+            any_fail = True
+            logger.exception("[Retry] Error retrying %s: %s", run_dir.name, e)
+        finally:
+            import os
+            if scrape_log_append is not None:
+                sys.stdout, sys.stderr = old_out, old_err
+                try:
+                    scrape_log_append.close()
+                except OSError:
+                    pass
+                scrape_log_append = None
+            os.chdir(old_cwd)
+
+    return 1 if any_fail else 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="Listing txt -> SHEIN scrape -> Listing - completed")
     parser.add_argument(
         "--once",
         action="store_true",
         help="Process all .txt in submitted folder once, then exit (no hourly loop).",
+    )
+    parser.add_argument(
+        "--retry",
+        action="store_true",
+        help="Only retry failed URLs from _retry.txt in completed folders.",
     )
     args = parser.parse_args()
 
@@ -279,16 +397,30 @@ def main():
     FAILED_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
+    if args.retry:
+        logger.info("Retry mode — re-running failed URLs")
+        state_tracker.start(mode="retry")
+        try:
+            raise SystemExit(run_retry())
+        finally:
+            state_tracker.stop("retry_done")
+
     if args.once:
         logger.info("Take Orders — single batch")
         logger.info("Submitted: %s", INBOX_DIR)
-        raise SystemExit(run_batch_once())
+        state_tracker.start(mode="once")
+        try:
+            raise SystemExit(run_batch_once())
+        finally:
+            state_tracker.stop("once_done")
 
     logger.info("Take Orders worker started (hourly poll). Inbox: %s", INBOX_DIR)
+    state_tracker.start(mode="loop")
 
     while True:
         txt_files = sorted(INBOX_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime)
         if not txt_files:
+            state_tracker.idle(f"sleeping_{POLL_SECONDS}s")
             time.sleep(POLL_SECONDS)
             continue
 
@@ -299,9 +431,11 @@ def main():
                 if ok:
                     move_file(txt, PROCESSED_DIR)
                     logger.info("Done. Output folder: %s", msg)
+                    state_tracker.file_done(txt.name, ok=True, msg=msg)
                 else:
                     move_file(txt, FAILED_DIR)
                     logger.warning("Failed: %s", msg)
+                    state_tracker.file_done(txt.name, ok=False, msg=msg)
             except Exception as e:
                 logger.exception("Error: %s", e)
                 tb = traceback.format_exc()
@@ -310,6 +444,7 @@ def main():
                 except OSError:
                     pass
                 move_file(txt, FAILED_DIR)
+                state_tracker.error(str(e), file=txt.name)
 
 
 if __name__ == "__main__":
