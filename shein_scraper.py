@@ -1622,9 +1622,41 @@ _STOPWORDS = {
     "of", "in", "on", "by", "from", "shop", "online", "fashion"
 }
 
+# Acronyms / units that look like a brand prefix but must be kept.
+_BRAND_WHITELIST = {
+    "DIY", "USA", "USB", "LED", "PCS", "OZ", "ML", "LB", "LBS", "CM", "MM", "KG",
+    "FT", "UV", "UK", "EU", "US", "3D", "4K", "HD", "XL", "XXL", "LCD", "TV",
+    "DC", "AC", "RGB", "PVC", "ABS", "BPA", "OEM", "PU", "TPU",
+}
+
 
 def _clean_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _strip_brand_prefix(title: str) -> str:
+    """Drop leading brand-name tokens (up to first 2).
+
+    Rules:
+      - All-caps alpha token, length 2..12 → drop (consecutive, max 2).
+      - First-position PascalCase token (initial cap + ≥1 internal cap, alpha, len ≥4) → drop one.
+      - Whitelist (unit/acronym) stops the scan.
+    """
+    parts = title.split()
+    drop = 0
+    for i, w in enumerate(parts[:2]):
+        core = w.strip(",.;:()[]{}!?\"")
+        if not core or core in _BRAND_WHITELIST:
+            break
+        if core.isalpha() and core.isupper() and 2 <= len(core) <= 12:
+            drop += 1
+            continue
+        if i == 0 and core.isalpha() and len(core) >= 4 and core[0].isupper() \
+                and any(c.isupper() for c in core[1:]):
+            drop += 1
+            break
+        break
+    return " ".join(parts[drop:])
 
 
 def _make_ebay_title(original_title: str, variations: dict, max_len: int = 80) -> str:
@@ -1635,6 +1667,7 @@ def _make_ebay_title(original_title: str, variations: dict, max_len: int = 80) -
     t = _clean_ws(original_title)
     if not t:
         return ""
+    t = _strip_brand_prefix(t)
 
     # 1) 提取颜色
     color = ""
@@ -1652,7 +1685,7 @@ def _make_ebay_title(original_title: str, variations: dict, max_len: int = 80) -
         "style", "type", "series", "material", "product", "item", "items",
         "home", "decor", "decoration", "room", "living", "bedroom",
     }
-    words = re.findall(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*", t)
+    words = re.findall(r"[A-Za-z0-9]+(?:['.\-][A-Za-z0-9]+)*", t)
     kept = []
     seen = set()
     for w in words:

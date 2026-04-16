@@ -1,5 +1,13 @@
 # Shein Product Scraper - CHANGELOG
 
+## v2.5.1 — 2026-04-16
+- **eBay 标题去品牌**: 自动剥离开头 1-2 个全大写品牌词（UMAY/NIKE PRO 等）或首位 PascalCase 品牌词（EastVita/SheGlam 等）
+- **白名单保护**: DIY/USA/USB/LED/PCS/OZ/ML/LB/CM/RGB/PVC 等缩写/单位不会被误删
+- **数字+单位保留**: token 正则加点号支持，`0.25LB / 0.5LB / 1.5oz / 3.5ft` 等整体保留，不再被句号断成 `0` 和 `25LB`
+- **示例对比**:
+  - `UMAY 8 Shape Resistance Bands...` → 删 UMAY，输出 `8 Shape Resistance Bands Handles Figure Exercise Band Full Body Workout Gym Yoga`
+  - `EastVita ... (0.25LB/0.5LB/0.75LB/1LB)` → 删 EastVita 且单位完整：`Fractional Weight Plates 8 0.25LB 0.5LB 0.75LB 1LB Micro Barbell Strength`
+
 ## v2.5 — 2026-04-16
 - **本地 Dashboard**: 新增 `dashboard.py`（stdlib 零依赖，端口 5055），自动刷新 3s，显示健康徽章（OK/WARN/DEAD）、当前 txt 文件、URL 进度条 x/y、最近 8 条事件、最新 debug log 尾部 25 行
 - **卡住判定**: 心跳 >60s 黄色 WARN，>5min 红色 DEAD；PID 死掉直接 DEAD
