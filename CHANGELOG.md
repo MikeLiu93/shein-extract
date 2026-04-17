@@ -1,5 +1,12 @@
 # Shein Product Scraper - CHANGELOG
 
+## v2.5.2 — 2026-04-17
+- **断点续传**: worker 重跑时自动检测输出文件夹中已完成的 seq 子文件夹（含文件即为完成），跳过已完成的 URL，只跑剩余部分
+- **复用原文件夹**: 不再创建 `-2` 新文件夹，直接在已有目录续写
+- **恢复 Excel**: 续传结果单独写入 `shein_products_{store}_{seq}_resumed.xlsx`，与 retry 的 `2nd run` 逻辑一致
+- **全部已完成检测**: 如果所有 seq 都已完成，直接标 done，不启动 Chrome
+- **新增 `_detect_completed_seqs()`**: 扫描 run_dir 下纯数字命名的非空子文件夹
+
 ## v2.5.1 — 2026-04-16
 - **eBay 标题去品牌**: 自动剥离开头 1-2 个全大写品牌词（UMAY/NIKE PRO 等）或首位 PascalCase 品牌词（EastVita/SheGlam 等）
 - **白名单保护**: DIY/USA/USB/LED/PCS/OZ/ML/LB/CM/RGB/PVC 等缩写/单位不会被误删

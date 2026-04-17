@@ -188,6 +188,18 @@ def unique_output_folder(root: Path, base_name: str) -> Path:
         i += 1
 
 
+def _detect_completed_seqs(run_dir: Path) -> set[int]:
+    """Scan run_dir for seq sub-folders that contain at least one file (= completed)."""
+    done = set()
+    if not run_dir.is_dir():
+        return done
+    for d in run_dir.iterdir():
+        if d.is_dir() and d.name.isdigit():
+            if any(d.iterdir()):
+                done.add(int(d.name))
+    return done
+
+
 def process_order_file(txt_path: Path) -> tuple[bool, str]:
     try:
         urls = read_urls(txt_path)
@@ -203,7 +215,33 @@ def process_order_file(txt_path: Path) -> tuple[bool, str]:
     employee = _parse_employee_code(txt_path.stem)
     out_root = OUTPUT_ROOT / employee if employee else OUTPUT_ROOT
     out_root.mkdir(parents=True, exist_ok=True)
-    run_dir = unique_output_folder(out_root, txt_path.stem)
+
+    start_seq, _ = _parse_seq_from_filename(txt_path.stem)
+
+    # --- Resume detection: reuse existing folder if present ---
+    existing_dir = out_root / _safe_name(txt_path.stem)
+    resume_urls = urls
+    resume_seqs = None
+
+    if existing_dir.is_dir():
+        completed = _detect_completed_seqs(existing_dir)
+        if completed:
+            resume_urls = []
+            resume_seqs = []
+            for i, url in enumerate(urls):
+                seq = start_seq + i
+                if seq not in completed:
+                    resume_urls.append(url)
+                    resume_seqs.append(seq)
+            logger.info("[Resume] %d/%d already done (seq %s), %d remaining",
+                        len(completed), len(urls), sorted(completed), len(resume_urls))
+            if not resume_urls:
+                logger.info("[Resume] All URLs already completed.")
+                return True, str(existing_dir) + " (all done)"
+        run_dir = existing_dir
+    else:
+        run_dir = unique_output_folder(out_root, txt_path.stem)
+
     try:
         shutil.copy2(txt_path, run_dir / txt_path.name)
     except OSError as e:
@@ -224,11 +262,17 @@ def process_order_file(txt_path: Path) -> tuple[bool, str]:
             scrape_log_append.flush()
             sys.stdout = _TeeIO(old_out, scrape_log_append)
             sys.stderr = _TeeIO(old_err, scrape_log_append)
-        start_seq, _ = _parse_seq_from_filename(txt_path.stem)
         suffix = _parse_store_and_seq_label(txt_path.stem)
-        xlsx_name = f"shein_products_{suffix}.xlsx" if suffix else "shein_products.xlsx"
-        logger.info("Seq range: start=%d, %d URLs, output=%s", start_seq, len(urls), xlsx_name)
-        scrape_shein(urls, output=xlsx_name, start_seq=start_seq)
+        if resume_seqs is not None:
+            xlsx_name = f"shein_products_{suffix}_resumed.xlsx" if suffix else "shein_products_resumed.xlsx"
+            logger.info("[Resume] %d URLs, seq_list=%s, output=%s",
+                        len(resume_urls), resume_seqs, xlsx_name)
+            state_tracker.set_file(txt_path.name, total_urls=len(resume_urls))
+            scrape_shein(resume_urls, output=xlsx_name, seq_list=resume_seqs)
+        else:
+            xlsx_name = f"shein_products_{suffix}.xlsx" if suffix else "shein_products.xlsx"
+            logger.info("Seq range: start=%d, %d URLs, output=%s", start_seq, len(urls), xlsx_name)
+            scrape_shein(urls, output=xlsx_name, start_seq=start_seq)
     finally:
         import os
 
