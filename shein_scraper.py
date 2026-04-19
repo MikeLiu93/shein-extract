@@ -1659,17 +1659,33 @@ def _strip_brand_prefix(title: str) -> str:
     return " ".join(parts[drop:])
 
 
+_ARTICLE_RE = re.compile(r'\b(?:the|a|an)\b', re.IGNORECASE)
+_NOISE_PHRASE_RE = re.compile(
+    r',?\s*\b(?:Shop\s+Online|Free\s+Shipping|Limited\s+Time|Best\s+Seller'
+    r'|Hot\s+Sale|New\s+Arrival|SHEIN|SheIn)\b',
+    re.IGNORECASE,
+)
+_SEGMENT_SPLIT_RE = re.compile(r'\s*[,;]\s+|\s+[-–—]+\s+')
+
+
 def _make_ebay_title(original_title: str, variations: dict, max_len: int = 80) -> str:
     """
-    生成更优质的 eBay 标题（<=80字符）。
-    策略：保留全部有意义的关键词，去重去噪，按空间决定是否加 NEW / FREE SHIPPING。
+    Generate an eBay title (<=80 chars) that preserves the original structure,
+    punctuation (inches, ranges, units), and meaning.
     """
     t = _clean_ws(original_title)
     if not t:
         return ""
     t = _strip_brand_prefix(t)
 
-    # 1) 提取颜色
+    # 1) Light cleanup: remove articles and marketing noise phrases
+    t = _NOISE_PHRASE_RE.sub('', t)
+    t = _ARTICLE_RE.sub('', t)
+    t = re.sub(r'\(\s*\)', '', t)          # empty parens left after removal
+    t = re.sub(r'^\s*[,;]\s*', '', t)      # leading separator
+    t = _clean_ws(t)
+
+    # 2) Extract color from variations
     color = ""
     if isinstance(variations, dict):
         for k in variations.keys():
@@ -1679,60 +1695,59 @@ def _make_ebay_title(original_title: str, variations: dict, max_len: int = 80) -
                     color = _clean_ws(str(vals[0]))
                 break
 
-    # 2) 去掉标题中的噪声词和重复词，保留有意义的关键词
-    noise = _STOPWORDS | {
-        "shein", "sheglam", "local", "pcs", "set", "pack", "suitable",
-        "style", "type", "series", "material", "product", "item", "items",
-        "home", "decor", "decoration", "room", "living", "bedroom",
-    }
-    words = re.findall(r"[A-Za-z0-9]+(?:['.\-][A-Za-z0-9]+)*", t)
-    kept = []
-    seen = set()
-    for w in words:
-        lw = w.lower()
-        if lw in noise and len(lw) <= 5:
-            continue
-        if lw in seen:
-            continue
-        seen.add(lw)
-        # 纯数字保留（如尺寸 "21" "145cm"）
-        kept.append(w.capitalize() if w.islower() else w)
+    # 3) Split into segments (comma / dash / semicolon delimited)
+    segments = [s.strip() for s in _SEGMENT_SPLIT_RE.split(t) if s.strip()]
+    if not segments:
+        return ""
 
-    core = " ".join(kept)
+    # 4) Join segments front-to-back, fitting within max_len
+    core = segments[0]
+    for seg in segments[1:]:
+        candidate = f"{core}, {seg}"
+        if len(candidate) <= max_len:
+            core = candidate
+        else:
+            remaining = max_len - len(core) - 2  # ", "
+            if remaining > 10:
+                partial = seg[:remaining + 1]
+                idx = partial.rfind(' ')
+                if idx > remaining // 2:
+                    partial = partial[:idx]
+                else:
+                    partial = partial[:remaining]
+                core = f"{core}, {partial.rstrip(' ,;-')}"
+            break
 
-    # 3) 如果颜色不在标题中，追加
+    # 5) Append color if not already present
     if color and color.lower() not in core.lower():
-        core = f"{core} {color}"
+        with_color = f"{core} {color}"
+        if len(with_color) <= max_len:
+            core = with_color
 
-    # 4) 根据剩余空间决定是否加 NEW / FREE SHIPPING
+    # 6) Add NEW / FREE SHIPPING tags when space allows
     tag_free = " FREE SHIPPING"
     tag_new = "NEW "
-    budget = max_len
 
-    # 尝试：NEW + core + FREE SHIPPING
     full = f"{tag_new}{core}{tag_free}"
-    if len(full) <= budget:
+    if len(full) <= max_len:
         return full
-
-    # 尝试：core + FREE SHIPPING
     mid = f"{core}{tag_free}"
-    if len(mid) <= budget:
+    if len(mid) <= max_len:
         return mid
-
-    # 尝试：NEW + core
     mid2 = f"{tag_new}{core}"
-    if len(mid2) <= budget:
+    if len(mid2) <= max_len:
         return mid2
-
-    # 只保留 core，截断到 80 字符
-    if len(core) <= budget:
+    if len(core) <= max_len:
         return core
 
-    # 截断到单词边界
-    truncated = core[:budget + 1]
-    if " " in truncated:
-        truncated = truncated.rsplit(" ", 1)[0]
-    return truncated.strip(" -,")
+    # Truncate at word boundary
+    truncated = core[:max_len + 1]
+    idx = truncated.rfind(' ')
+    if idx > max_len // 2:
+        truncated = truncated[:idx]
+    else:
+        truncated = truncated[:max_len]
+    return truncated.rstrip(' ,-;')
 
 
 def _safe_filename(s: str) -> str:
