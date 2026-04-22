@@ -1,5 +1,11 @@
 # Shein Product Scraper - CHANGELOG
 
+## v2.7 — 2026-04-23
+- **AI 验证码自动解决**: 检测到 GeeTest 图标点选验证码时，自动截图发给 Claude Vision API 识别图标位置，CDP 模拟鼠标按顺序点击（带随机偏移 +-3px + 随机间隔 300-800ms）
+- **三层防御**: AI 自动解决（最多 3 次） → 刷新页面后再 AI → 邮件通知等待人工
+- **调试截图**: 每次 AI 尝试保存截图 `_captcha_ai_attempt_{n}.png` 方便分析失败原因
+- **验证码样本收集**: 收集 29 张历史验证码截图到 `exam pics/collected/`，全部为 GeeTest 图标点选类型
+
 ## v2.6 — 2026-04-22
 - **AI 标题生成**: 调用 Claude Haiku API 生成 eBay 标题，品牌识别更准确（Pempet/EastVita 等规则难覆盖的品牌也能删），智能去重（Dog Cage Dog Kennel → Dog Crate Kennel），单位和标点完整保留
 - **自动 fallback**: API 调用失败（超时/无 key/返回异常）自动回退到规则引擎，不影响爬虫主流程

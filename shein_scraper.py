@@ -990,6 +990,200 @@ def _take_screenshot(ws_url, save_path: str) -> bool:
     return False
 
 
+CAPTCHA_AI_MAX_ATTEMPTS = 3       # AI 尝试解决验证码的最大次数
+
+_CAPTCHA_VISION_PROMPT = """\
+This is a GeeTest icon-click CAPTCHA screenshot from a SHEIN product page.
+
+At the top of the CAPTCHA panel there is text "Please select the following graphics in order:" followed by 2-4 small reference icons.
+
+Below that is a photo with several colored icons scattered on it. The user must click the icons in the photo that match the reference icons, in the correct left-to-right order shown at the top.
+
+Tasks:
+1. Identify each reference icon at the top (describe color and shape).
+2. Find each matching icon in the photo below.
+3. Report the pixel coordinates (x, y) to click, relative to the FULL screenshot image which is {width}x{height} pixels.
+
+Reply with ONLY valid JSON, no markdown fences, no explanation:
+{{"icons": [{{"order": 1, "description": "blue rocket", "x": 710, "y": 360}}, ...]}}"""
+
+
+def _solve_captcha_ai(port, tab_id) -> bool:
+    """
+    Attempt to solve a GeeTest icon-click CAPTCHA using Claude Vision API.
+    Takes a CDP screenshot, sends to API, clicks icons in order, then clicks Confirm.
+    Returns True if solved, False otherwise.
+    """
+    import base64 as _b64
+    import random
+
+    api_key = _get_api_key()
+    if not api_key:
+        print("  [AI验证] No API key, skipping AI solve")
+        return False
+
+    ws_url = _ws_url_for_id(port, tab_id)
+
+    for attempt in range(CAPTCHA_AI_MAX_ATTEMPTS):
+        print(f"  [AI验证] 尝试 {attempt + 1}/{CAPTCHA_AI_MAX_ATTEMPTS}...")
+
+        # 1. Take CDP screenshot (full viewport)
+        try:
+            res = _cdp_once(ws_url, "Page.captureScreenshot", {"format": "png"}, timeout=15)
+            img_b64 = res.get("data")
+            if not img_b64:
+                print("  [AI验证] 截图失败")
+                return False
+        except Exception as e:
+            print(f"  [AI验证] 截图异常: {e}")
+            return False
+
+        # Get image dimensions
+        try:
+            import io
+            from PIL import Image as _PILImage
+            img_bytes = _b64.b64decode(img_b64)
+            _pil = _PILImage.open(io.BytesIO(img_bytes))
+            img_w, img_h = _pil.size
+        except Exception:
+            img_w, img_h = 1920, 1080  # fallback
+
+        # Save screenshot for debugging
+        try:
+            ss_path = Path(base_dir) / f"_captcha_ai_attempt_{attempt + 1}.png"
+            ss_path.write_bytes(img_bytes)
+        except Exception:
+            pass
+
+        # 2. Send to Claude Vision API
+        try:
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 500,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": {
+                                "type": "base64", "media_type": "image/png", "data": img_b64}},
+                            {"type": "text", "text": _CAPTCHA_VISION_PROMPT.format(
+                                width=img_w, height=img_h)},
+                        ],
+                    }],
+                },
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                print(f"  [AI验证] API 返回 {resp.status_code}")
+                continue
+        except Exception as e:
+            print(f"  [AI验证] API 请求异常: {e}")
+            continue
+
+        # 3. Parse response
+        try:
+            text = resp.json().get("content", [{}])[0].get("text", "")
+            # Strip markdown code fences if present
+            text = re.sub(r'^```(?:json)?\s*', '', text.strip())
+            text = re.sub(r'\s*```$', '', text.strip())
+            data = json.loads(text)
+            icons = data.get("icons", [])
+            if not icons:
+                print("  [AI验证] API 返回空图标列表")
+                continue
+            icons.sort(key=lambda ic: ic.get("order", 0))
+            print(f"  [AI验证] 识别到 {len(icons)} 个图标: "
+                  + ", ".join(f'{ic.get("description","")}@({ic["x"]},{ic["y"]})' for ic in icons))
+        except Exception as e:
+            print(f"  [AI验证] 解析响应失败: {e}")
+            continue
+
+        # 4. Click icons in order via CDP (with human-like delays)
+        try:
+            ws_url = _ws_url_for_id(port, tab_id)
+            for ic in icons:
+                x, y = float(ic["x"]), float(ic["y"])
+                # Small random offset (+-3px) for human-like behavior
+                x += random.uniform(-3, 3)
+                y += random.uniform(-3, 3)
+                _cdp_once(ws_url, "Input.dispatchMouseEvent", {
+                    "type": "mousePressed", "x": x, "y": y,
+                    "button": "left", "clickCount": 1,
+                })
+                _cdp_once(ws_url, "Input.dispatchMouseEvent", {
+                    "type": "mouseReleased", "x": x, "y": y,
+                    "button": "left", "clickCount": 1,
+                })
+                delay = random.uniform(0.3, 0.8)
+                print(f"  [AI验证] 点击 ({x:.0f},{y:.0f}) 等 {delay:.1f}s")
+                time.sleep(delay)
+        except Exception as e:
+            print(f"  [AI验证] 点击异常: {e}")
+            continue
+
+        # 5. Click "Confirm" button
+        time.sleep(random.uniform(0.3, 0.6))
+        try:
+            ws_url = _ws_url_for_id(port, tab_id)
+            _run_js(ws_url, """
+                var btns = document.querySelectorAll(
+                    '.geetest_commit_tip, .geetest_commit, [class*="commit"], button'
+                );
+                for (var b of btns) {
+                    if (b.textContent.trim().toLowerCase().includes('confirm')
+                        || b.textContent.trim() === '确认') {
+                        b.click(); break;
+                    }
+                }
+            """)
+            print("  [AI验证] 已点击 Confirm")
+        except Exception as e:
+            print(f"  [AI验证] Confirm 点击异常: {e}")
+
+        # 6. Wait and check if solved
+        time.sleep(2.5)
+        try:
+            ws_url = _ws_url_for_id(port, tab_id)
+            check = _run_js(ws_url, _JS_DETECT_BLOCK)
+            if not isinstance(check, dict) or not check.get("blocked"):
+                print(f"  [AI验证] 验证码已通过！(尝试 {attempt + 1})")
+                return True
+            print(f"  [AI验证] 尝试 {attempt + 1} 未通过，验证码仍在")
+        except Exception:
+            # If page navigated away, captcha is likely solved
+            print(f"  [AI验证] 页面状态变化，可能已通过")
+            return True
+
+        # Click Refresh for next attempt
+        if attempt < CAPTCHA_AI_MAX_ATTEMPTS - 1:
+            time.sleep(1)
+            try:
+                ws_url = _ws_url_for_id(port, tab_id)
+                _run_js(ws_url, """
+                    var links = document.querySelectorAll(
+                        '.geetest_refresh, [class*="refresh"], a, span'
+                    );
+                    for (var a of links) {
+                        if (a.textContent.trim().toLowerCase().includes('refresh')) {
+                            a.click(); break;
+                        }
+                    }
+                """)
+                print("  [AI验证] 已点击 Refresh，等待新验证码...")
+                time.sleep(2)
+            except Exception:
+                pass
+
+    print("  [AI验证] AI 解决失败，转人工处理")
+    return False
+
+
 def _check_and_handle_block(port, tab_id, url, base_dir, max_wait=300):
     """
     检测登录弹窗/验证码拦截。
@@ -1036,11 +1230,16 @@ def _check_and_handle_block(port, tab_id, url, base_dir, max_wait=300):
         alert_signin(url, screenshot_path=ss_path)
         return False
 
-    # ── 验证码：先自动刷新重试，再等待 ──
+    # ── 验证码：AI 自动解决 → 刷新重试 → 邮件等待人工 ──
     if "captcha" in block_type:
-        # 第一步：尝试自动刷新绕过验证码
+        # 第一步：AI 自动解决（Vision API + CDP 点击）
+        base_dir_path = Path(base_dir) if not isinstance(base_dir, Path) else base_dir
+        if _solve_captcha_ai(port, tab_id):
+            return True
+
+        # 第二步：AI 失败，尝试刷新绕过
         for retry in range(CAPTCHA_AUTO_RETRIES):
-            print(f"  [拦截处理] 验证码自动重试 {retry + 1}/{CAPTCHA_AUTO_RETRIES}：刷新页面...")
+            print(f"  [拦截处理] 验证码刷新重试 {retry + 1}/{CAPTCHA_AUTO_RETRIES}...")
             try:
                 ws_url = _ws_url_for_id(port, tab_id)
                 _cdp_once(ws_url, "Page.navigate", {"url": url})
@@ -1051,12 +1250,15 @@ def _check_and_handle_block(port, tab_id, url, base_dir, max_wait=300):
                 if not isinstance(check, dict) or not check.get("blocked"):
                     print(f"  [拦截处理] 刷新后验证码已消失（重试 {retry + 1}）")
                     return True
+                # Refresh brought back captcha — try AI again
+                if _solve_captcha_ai(port, tab_id):
+                    return True
             except Exception:
                 pass
             time.sleep(3)
 
-        # 第二步：自动重试失败，立即截图 + 发邮件，然后继续等待
-        print(f"  [拦截处理] 自动重试失败，发送邮件通知，同时等待解决（最多 {max_wait}s）...")
+        # 第三步：全部自动方式失败，截图 + 发邮件 + 等待人工
+        print(f"  [拦截处理] 自动解决失败，发送邮件通知，等待人工（最多 {max_wait}s）...")
         ss_path = str(Path(base_dir) / "_block_screenshot.png")
         try:
             ws_url = _ws_url_for_id(port, tab_id)
@@ -1065,7 +1267,6 @@ def _check_and_handle_block(port, tab_id, url, base_dir, max_wait=300):
             ss_path = None
         alert_captcha(url, screenshot_path=ss_path)
 
-        # 第三步：继续等待人工解决
         elapsed = 0
         poll = 15
         while elapsed < max_wait:
@@ -1081,7 +1282,6 @@ def _check_and_handle_block(port, tab_id, url, base_dir, max_wait=300):
                 pass
             print(f"  [拦截处理] 仍在等待验证码... ({elapsed}/{max_wait}s)")
 
-        # 超时
         print("  [拦截处理] 验证码等待超时")
         return False
 
