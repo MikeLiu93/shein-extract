@@ -1,5 +1,13 @@
 # Shein Product Scraper - CHANGELOG
 
+## v2.6 — 2026-04-22
+- **AI 标题生成**: 调用 Claude Haiku API 生成 eBay 标题，品牌识别更准确（Pempet/EastVita 等规则难覆盖的品牌也能删），智能去重（Dog Cage Dog Kennel → Dog Crate Kennel），单位和标点完整保留
+- **自动 fallback**: API 调用失败（超时/无 key/返回异常）自动回退到规则引擎，不影响爬虫主流程
+- **后处理修复**: 截断的 "FREE SH"/"FREE SHIP" 等残缺标签自动清除
+- **eBay 描述文件复用**: `eBay上架描述.txt` 直接使用已生成的 AI 标题，不重复调 API
+- **API key 配置**: 从 `.env` 文件读取 `ANTHROPIC_API_KEY`（已 gitignore）
+- **成本**: Haiku 每个标题约 $0.0003，100 个商品约 $0.03
+
 ## v2.5.3 — 2026-04-20
 - **eBay 标题重构**: 从"拆词重组关键词"改为"保留原文结构按段截断"，不再扭曲含义
 - **标点保留**: 英寸 `"` (`29"-45"`)、斜杠 `/` (`24"/30"/36"`)、括号 `()` (`(0.25LB/0.5LB)`)、连字符 `-` (`Type-C`) 全部原样保留

@@ -1615,7 +1615,84 @@ def _save_excel(records, path):
     wb.save(path)
 
 
-# ── Text summary + eBay title ─────────────────────────────────────────────────
+# ── AI-powered eBay title generation ──────────────────────────────────────────
+
+_ANTHROPIC_API_KEY: str | None = None
+
+
+def _get_api_key() -> str | None:
+    global _ANTHROPIC_API_KEY
+    if _ANTHROPIC_API_KEY is not None:
+        return _ANTHROPIC_API_KEY or None
+    # Try .env in project dir
+    env_path = Path(__file__).resolve().parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("ANTHROPIC_API_KEY="):
+                _ANTHROPIC_API_KEY = line.split("=", 1)[1].strip()
+                return _ANTHROPIC_API_KEY
+    # Fallback to environment variable
+    _ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+    return _ANTHROPIC_API_KEY or None
+
+
+_EBAY_TITLE_PROMPT = """\
+Rewrite this SHEIN product title into an eBay listing title (max 80 characters).
+
+Rules:
+1. REMOVE brand names (usually the first 1-2 words, e.g. "UMAY", "EastVita", "Pempet", "NIKE PRO", "SheGlam"). Common nouns like "Dog", "Kids" are NOT brands.
+2. KEEP all measurements/units with punctuation: 29"-45", 0.25LB, 24"/30"/36", 2", 100ml, 3.5oz.
+3. KEEP structural punctuation: inch marks ", ranges -, slashes /, parentheses ().
+4. Use the FULL 80 characters as much as possible — prioritize keeping more keywords.
+5. ALWAYS start with "NEW " and end with " FREE SHIPPING" if the total is ≤ 80 chars. If too long, try just "NEW " prefix. Drop tags only as a last resort.
+6. Do NOT invent information. Only use words from the original title.
+7. Remove redundant repeated words (e.g. "Dog Cage Dog Kennel" → "Dog Cage Kennel").
+
+Original: {title}
+
+Reply with ONLY the title, no quotes, no explanation."""
+
+
+def _make_ebay_title_ai(original_title: str) -> str | None:
+    """Call Claude Haiku to generate an eBay title. Returns None on failure."""
+    api_key = _get_api_key()
+    if not api_key:
+        return None
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 120,
+                "messages": [{"role": "user",
+                              "content": _EBAY_TITLE_PROMPT.format(title=original_title)}],
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return None
+        text = resp.json().get("content", [{}])[0].get("text", "").strip()
+        # Strip wrapping quotes if present
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+            text = text[1:-1].strip()
+        # Fix truncated FREE SHIPPING (e.g. "FREE SH", "FREE SHIP")
+        m = re.search(r'\s+FREE\s+\S*$', text)
+        if m and 'FREE SHIPPING' not in text:
+            text = text[:m.start()].rstrip(' ,;-')
+        # Sanity: must be non-empty and ≤ 80 chars
+        if not text or len(text) > 80:
+            return None
+        return text
+    except Exception:
+        return None
+
+
+# ── Fallback rule-based eBay title ───────────────────────────────────────────
 
 _STOPWORDS = {
     "women", "womens", "men", "mens", "for", "and", "the", "a", "an", "with", "to",
@@ -1765,7 +1842,7 @@ def _write_ebay_listing_txt(rec: dict, media_folder) -> "Path | None":
     ebay_price = rec.get("ebay_price", "")
     variations = rec.get("variations") or {}
     sku_prices = rec.get("sku_prices") or []
-    ebay_title = _make_ebay_title(original_title, variations)
+    ebay_title = rec.get("ebay_title") or _make_ebay_title(original_title, variations)
 
     if isinstance(ebay_price, (int, float)):
         ep_line = f"eBay价格: ${float(ebay_price):.2f}"
@@ -2349,10 +2426,17 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
                                 if all_vals:
                                     rec["variations"][ak] = all_vals
 
-                # 生成 eBay title 并存入 rec
-                rec["ebay_title"] = _make_ebay_title(
-                    rec.get("original_title", ""), rec.get("variations", {})
-                )
+                # 生成 eBay title：AI 优先，失败 fallback 规则
+                _orig_t = rec.get("original_title", "")
+                _ai_title = _make_ebay_title_ai(_orig_t)
+                if _ai_title:
+                    rec["ebay_title"] = _ai_title
+                    print(f"  eBay title : {_ai_title} (AI)")
+                else:
+                    rec["ebay_title"] = _make_ebay_title(
+                        _orig_t, rec.get("variations", {})
+                    )
+                    print(f"  eBay title : {rec['ebay_title']} (fallback)")
 
                 seq = rec["seq_num"]
                 goods_imgs_count = len(rec.get("goods_imgs") or [])
