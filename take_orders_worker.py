@@ -262,6 +262,11 @@ def process_order_file(txt_path: Path) -> tuple[bool, str]:
             scrape_log_append.flush()
             sys.stdout = _TeeIO(old_out, scrape_log_append)
             sys.stderr = _TeeIO(old_err, scrape_log_append)
+        # Set title style per employee for multi-store anti-association
+        import shein_scraper as _ss
+        _ss._TITLE_STYLE = employee
+        logger.info("Title style: %s", employee or "(default)")
+
         suffix = _parse_store_and_seq_label(txt_path.stem)
         if resume_seqs is not None:
             xlsx_name = f"shein_products_{suffix}_resumed.xlsx" if suffix else "shein_products_resumed.xlsx"
