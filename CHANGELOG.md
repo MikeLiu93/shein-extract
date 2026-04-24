@@ -1,7 +1,9 @@
 # Shein Product Scraper - CHANGELOG
 
-## v2.7.1 — 2026-04-23
-- **限流等待缩短**: 连续 3 次失败判定限流后，sleep 从 2 小时改为 45 分钟
+## v2.7.1 — 2026-04-25
+- **反限流修复**: `Page.navigate` 加 `referrer: us.shein.com` + `transitionType: link`，模拟站内跳转而非直接输入 URL（Shein 把无 referrer 的导航判定为机器人）
+- **反检测脚本**: 每次导航前注入 JS 隐藏 `navigator.webdriver` 和 CDP 自动化特征
+- **限流等待恢复**: sleep 恢复为 2 小时
 
 ## v2.7 — 2026-04-23
 - **AI 验证码自动解决**: 检测到 GeeTest 图标点选验证码时，自动截图发给 Claude Vision API 识别图标位置，CDP 模拟鼠标按顺序点击（带随机偏移 +-3px + 随机间隔 300-800ms）

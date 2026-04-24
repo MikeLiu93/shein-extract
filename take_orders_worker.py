@@ -333,9 +333,9 @@ def run_batch_once() -> int:
                 logger.warning("Failed: %s", msg)
         except RateLimitError:
             logger.warning("[限流] Shein 限流检测触发，当前文件已保存已完成部分。")
-            logger.info("[限流] 等待 45 分钟后自动继续剩余文件...")
-            time.sleep(2700)
-            logger.info("[限流] 45 分钟已到，继续处理...")
+            logger.info("[限流] 等待 2 小时后自动继续剩余文件...")
+            time.sleep(7200)
+            logger.info("[限流] 2 小时已到，继续处理...")
         except Exception as e:
             any_fail = True
             logger.exception("Error processing %s: %s", txt.name, e)

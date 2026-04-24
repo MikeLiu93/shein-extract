@@ -955,6 +955,16 @@ def _wait_for_page_ready(port, tab_id, min_wait=PAGE_LOAD_MIN_WAIT,
     return None, _ws_url_for_id(port, tab_id)
 
 
+_SHEIN_REFERRER = "https://us.shein.com/"
+
+# Anti-detection JS injected before every page load
+_JS_ANTI_DETECT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+if (!window.chrome) { window.chrome = {}; }
+if (!window.chrome.runtime) { window.chrome.runtime = {}; }
+"""
+
+
 def _navigate_and_wait(port, url):
     """
     创建新标签页，通过 CDP 导航，智能等待页面就绪。
@@ -963,7 +973,17 @@ def _navigate_and_wait(port, url):
     tab_id, ws_url = _new_tab(port)
     if not ws_url or not tab_id:
         raise RuntimeError("Failed to create new tab via /json/new")
-    _cdp_once(ws_url, "Page.navigate", {"url": url})
+    # Inject anti-detection script before page loads
+    try:
+        _cdp_once(ws_url, "Page.addScriptToEvaluateOnNewDocument",
+                  {"source": _JS_ANTI_DETECT})
+    except Exception:
+        pass
+    _cdp_once(ws_url, "Page.navigate", {
+        "url": url,
+        "referrer": _SHEIN_REFERRER,
+        "transitionType": "link",
+    })
     # 智能等待
     _, ws_url = _wait_for_page_ready(port, tab_id)
     return _ws_url_for_id(port, tab_id), tab_id
@@ -1242,7 +1262,8 @@ def _check_and_handle_block(port, tab_id, url, base_dir, max_wait=300):
             print(f"  [拦截处理] 验证码刷新重试 {retry + 1}/{CAPTCHA_AUTO_RETRIES}...")
             try:
                 ws_url = _ws_url_for_id(port, tab_id)
-                _cdp_once(ws_url, "Page.navigate", {"url": url})
+                _cdp_once(ws_url, "Page.navigate", {
+                    "url": url, "referrer": _SHEIN_REFERRER, "transitionType": "link"})
                 _wait_for_page_ready(port, tab_id)
                 time.sleep(2)
                 ws_url = _ws_url_for_id(port, tab_id)
