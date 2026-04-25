@@ -113,9 +113,12 @@ def _parse_seq_from_filename(name: str) -> tuple[int, int]:
     """
     从文件名中提取 seq range，如 '20260331 - TT - B5 - 16-23' → (16, 23)
     或 '20260331-NA-L8-(28-32)' → (28, 32)
+    或 '20260424- LUMEI-Z4-111-140txt.' → (111, 140)
     返回 (start_seq, expected_end)。解析失败则返回 (1, 0)。
     """
-    m = re.search(r'\(?(\d+)\s*[-–]\s*(\d+)\)?\s*$', name)
+    # Strip trailing junk: repeated "txt", ".", spaces (e.g. "111-140txt..txt" → "111-140")
+    clean = re.sub(r'(?:[.\s]*txt)*[.\s]*$', '', name, flags=re.IGNORECASE)
+    m = re.search(r'\(?(\d+)\s*[-–]\s*(\d+)\)?\s*$', clean)
     if m:
         return int(m.group(1)), int(m.group(2))
     return 1, 0
@@ -130,8 +133,9 @@ def _parse_store_and_seq_label(name: str) -> str:
     start, end = _parse_seq_from_filename(name)
     seq_str = f"{start}-{end}" if start > 0 and end > 0 else ""
 
-    # 去掉末尾的 seq 部分（包括括号）和日期前缀
-    clean = re.sub(r'\(?\d+\s*[-–]\s*\d+\)?\s*$', '', name).strip().rstrip(' -–')
+    # 去掉末尾垃圾 (txt, .) 再去掉 seq 部分（包括括号）和日期前缀
+    clean = re.sub(r'(?:[.\s]*txt)*[.\s]*$', '', name, flags=re.IGNORECASE)
+    clean = re.sub(r'\(?\d+\s*[-–]\s*\d+\)?\s*$', '', clean).strip().rstrip(' -–')
     clean = re.sub(r'^\d{8}\s*[-–]?\s*', '', clean).strip().rstrip(' -–')
 
     # 现在 clean 应该是 "TT - B2" 或 "NA-L8"
