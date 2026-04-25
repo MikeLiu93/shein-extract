@@ -1,10 +1,11 @@
 # Shein Product Scraper - CHANGELOG
 
 ## v2.7.1 — 2026-04-25
-- **反限流修复**: `Page.navigate` 加 `referrer: us.shein.com` + `transitionType: link`，模拟站内跳转而非直接输入 URL（Shein 把无 referrer 的导航判定为机器人）
-- **反检测脚本**: 每次导航前注入 JS 隐藏 `navigator.webdriver` 和 CDP 自动化特征
+- **根治限流**: 不再每个 URL 创建新标签（机器人特征），改为**复用单个标签 + JS `window.location.href` 导航**（与真人点击链接完全一致）
+- **Session 预热**: 新 Chrome 首次自动访问 Shein 首页建立 cookies/session，后续导航不再被 API 限流
+- **反检测脚本**: 注入 JS 隐藏 `navigator.webdriver` 和 CDP 自动化痕迹
 - **限流等待恢复**: sleep 恢复为 2 小时
-- **验证通过**: 端到端测试跑通，加 referrer 后 Shein 不再拦截 CDP 导航
+- **验证通过**: 新 Chrome + 3 个 URL 连续跑通，每个 3 秒加载完成
 
 ## v2.7 — 2026-04-23
 - **AI 验证码自动解决**: 检测到 GeeTest 图标点选验证码时，自动截图发给 Claude Vision API 识别图标位置，CDP 模拟鼠标按顺序点击（带随机偏移 +-3px + 随机间隔 300-800ms）

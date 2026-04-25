@@ -964,27 +964,83 @@ if (!window.chrome) { window.chrome = {}; }
 if (!window.chrome.runtime) { window.chrome.runtime = {}; }
 """
 
+# Reusable tab ID — navigate the same tab instead of opening new ones
+_REUSE_TAB_ID: str | None = None
 
-def _navigate_and_wait(port, url):
+
+def _ensure_shein_tab(port):
     """
-    创建新标签页，通过 CDP 导航，智能等待页面就绪。
-    返回 (ws_url, tab_id)。
+    Ensure we have a reusable Shein tab. On first call, navigate an existing tab
+    to the Shein homepage to warm up cookies/session. Returns (tab_id, ws_url).
     """
-    tab_id, ws_url = _new_tab(port)
-    if not ws_url or not tab_id:
-        raise RuntimeError("Failed to create new tab via /json/new")
-    # Inject anti-detection script before page loads
+    global _REUSE_TAB_ID
+
+    # Check if our reusable tab still exists
+    if _REUSE_TAB_ID:
+        try:
+            ws_url = _ws_url_for_id(port, _REUSE_TAB_ID)
+            return _REUSE_TAB_ID, ws_url
+        except Exception:
+            _REUSE_TAB_ID = None
+
+    # Find an existing Shein page tab or any page tab
+    tabs = requests.get(f"http://localhost:{port}/json", timeout=5).json()
+    pages = [t for t in tabs if t.get("type") == "page"]
+    shein_pages = [t for t in pages if "shein.com" in (t.get("url") or "")]
+
+    if shein_pages:
+        tab = shein_pages[0]
+    elif pages:
+        tab = pages[0]
+    else:
+        tab = requests.put(f"http://localhost:{port}/json/new", timeout=5).json()
+
+    _REUSE_TAB_ID = tab["id"]
+    ws_url = tab.get("webSocketDebuggerUrl") or _ws_url_for_id(port, _REUSE_TAB_ID)
+
+    # Inject anti-detection
     try:
         _cdp_once(ws_url, "Page.addScriptToEvaluateOnNewDocument",
                   {"source": _JS_ANTI_DETECT})
     except Exception:
         pass
-    _cdp_once(ws_url, "Page.navigate", {
-        "url": url,
-        "referrer": _SHEIN_REFERRER,
-        "transitionType": "link",
-    })
-    # 智能等待
+
+    # If not already on a Shein page, warm up by visiting homepage
+    cur_url = tab.get("url", "")
+    if "shein.com" not in cur_url:
+        print("  [导航] 预热：先访问 Shein 首页建立 session...")
+        _cdp_once(ws_url, "Page.navigate", {
+            "url": _SHEIN_REFERRER,
+            "transitionType": "typed",
+        })
+        time.sleep(5)
+
+    return _REUSE_TAB_ID, _ws_url_for_id(port, _REUSE_TAB_ID)
+
+
+def _navigate_and_wait(port, url):
+    """
+    Reuse a single tab, navigate via JS (window.location.href) to mimic
+    in-site clicking. Waits for goods_sn to appear.
+    Returns (ws_url, tab_id).
+    """
+    tab_id, ws_url = _ensure_shein_tab(port)
+
+    # Navigate via JS — identical to clicking a link on the page
+    _run_js(ws_url, f'window.location.href = "{url}";')
+
+    # Wait for navigation to start, then poll for page ready
+    time.sleep(1)
+    # After JS navigation, ws_url changes — poll until tab is available again
+    for _ in range(10):
+        try:
+            ws_url = _ws_url_for_id(port, tab_id)
+            break
+        except Exception:
+            time.sleep(0.5)
+    else:
+        raise RuntimeError(f"Tab {tab_id} lost after JS navigation")
+
     _, ws_url = _wait_for_page_ready(port, tab_id)
     return _ws_url_for_id(port, tab_id), tab_id
 
@@ -2527,8 +2583,6 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
                     rec["status"] = "BLOCKED"
                     print("  [跳过] 页面被拦截，无法提取")
                     records.append(rec)
-                    if tab_id is not None:
-                        _close_tab(CDP_PORT, tab_id)
                     if i < len(urls):
                         time.sleep(DELAY_BETWEEN_PAGES)
                     continue
@@ -2702,9 +2756,7 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
                 rec["status"] = f"ERROR: {e}"
                 print(f"  ERROR: {e}")
             finally:
-                # 关闭用完的标签页（保持 Chrome 整洁）
-                if tab_id is not None:
-                    _close_tab(CDP_PORT, tab_id)
+                pass  # Tab is reused across URLs; do not close
 
             records.append(rec)
 
