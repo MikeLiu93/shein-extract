@@ -2587,6 +2587,26 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
                         time.sleep(DELAY_BETWEEN_PAGES)
                     continue
 
+                # 检测商品下架/404（Oops 页面）— 不计入连续失败
+                try:
+                    _is_oops = _run_js(ws_url, """
+                        document.body && (
+                            document.body.innerText.includes('Oops') ||
+                            document.querySelector('.page-not-found, .error-page, [class*="not-found"]') !== null
+                        )
+                    """)
+                    if _is_oops:
+                        rec["status"] = "DELISTED"
+                        rec["seq_num"] = seq_list[i - 1] if seq_list else start_seq + (i - 1)
+                        print("  [跳过] 商品已下架 (Oops 404)")
+                        records.append(rec)
+                        _consecutive_fails = 0  # 下架不算限流
+                        if i < len(urls):
+                            time.sleep(DELAY_BETWEEN_PAGES)
+                        continue
+                except Exception:
+                    pass
+
                 # 滚动触发懒加载，稍等片刻
                 try:
                     _run_js(ws_url, _JS_SCROLL_GALLERY)
