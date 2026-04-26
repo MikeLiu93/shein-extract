@@ -1,5 +1,20 @@
 # Shein Product Scraper - CHANGELOG
 
+## v3.0 — 2026-04-26
+- **Excel 管道 (run_excel.py)**: 从 TXT 输入切换到 Excel 输入（worksheet = 店铺），显式 Seq 列，Date/Status 自动回写
+- **库存检查 (check_stock.py)**: 轻量脚本，只加载页面提取库存，不下载图片。~8s/URL，1000 条约 2-4 小时
+- **自动备份**: 每次读取 Excel 前备份到 `D:\我的云端硬盘\Backup\Shein\总表\{名字}_{日期}.xlsx`
+- **写入保护**: 文件被其他人打开时自动保存为 `{名字}2.xlsx`，不报错不丢数据
+- **默认文件**: `python run_excel.py` 直接读 `Shein Submited Links.xlsx`，Test 文件需手动指定
+- **列名标准化**: `Execute Date` 自动改为 `Date`
+- **[goods_name] 秒跳**: 检测到标题为模板占位符立即标 Failed 跳过，不等 60 秒超时
+- **Seq 始终记录**: 即使 Failed 的行，output Excel 的 No. 列也正确填写 seq
+- **取消定时任务**: 删除 `SheinListing-TakeOrders`，改为手动运行
+- **停用 _retry.txt**: 失败记录直接在输入 Excel 追踪，不再生成 retry 文件
+- **超时缩短**: `EXTRACTION_TIMEOUT_SEC` 从 240s 降到 60s
+- **Output 命名**: `{store}-{seq_min}-{seq_max}-{date}.xlsx`
+- **截图归档**: captcha/block/timeout 截图自动移到 `screenshots/` 子文件夹
+
 ## v2.7.1 — 2026-04-25
 - **根治限流**: 不再每个 URL 创建新标签（机器人特征），改为**复用单个标签 + JS `window.location.href` 导航**（与真人点击链接完全一致）
 - **Session 预热**: 新 Chrome 首次自动访问 Shein 首页建立 cookies/session，后续导航不再被 API 限流
