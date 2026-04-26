@@ -2922,22 +2922,21 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
     _save_excel(expanded, output)
     print(f"\nSaved to '{output}'  ({len(expanded)} row(s), from {len(records)} product(s))")
 
-    # 生成 _retry.txt：记录失败的 URL，供 --retry 模式使用
-    failed = [r for r in records if r.get("status") not in ("OK", None)]
-    retry_path = Path(output).parent / "_retry.txt"
-    if failed:
-        lines = []
-        for r in failed:
-            seq = r.get("seq_num", "?")
-            status = r.get("status", "UNKNOWN")
-            url = r.get("url", "")
-            lines.append(f"{seq}\t{status}\t{url}")
-        retry_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        print(f"  [Retry] {len(failed)} 个失败 URL 已写入 {retry_path.name}")
-    else:
-        # 全部成功，删除旧的 _retry.txt（如果存在）
-        if retry_path.exists():
-            retry_path.unlink(missing_ok=True)
+    # _retry.txt 已停用 — 失败记录直接在输入 Excel 中标 Failed，下次手动重跑
+    # failed = [r for r in records if r.get("status") not in ("OK", None)]
+    # retry_path = Path(output).parent / "_retry.txt"
+    # if failed:
+    #     lines = []
+    #     for r in failed:
+    #         seq = r.get("seq_num", "?")
+    #         status = r.get("status", "UNKNOWN")
+    #         url = r.get("url", "")
+    #         lines.append(f"{seq}\t{status}\t{url}")
+    #     retry_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    #     print(f"  [Retry] {len(failed)} 个失败 URL 已写入 {retry_path.name}")
+    # else:
+    #     if retry_path.exists():
+    #         retry_path.unlink(missing_ok=True)
 
     if _rate_limited:
         raise RateLimitError(f"Shein 限流：连续 {RATE_LIMIT_CONSECUTIVE} 个 URL 失败")
