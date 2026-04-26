@@ -4,7 +4,7 @@ scrape them, write results to Listing - completed 2nd/{store}/, and update
 Date + Status columns in the source Excel.
 
 Usage:
-    python run_excel.py                          # scan submitted/ for .xlsx
+    python run_excel.py                          # default: Shein Submited Links.xlsx
     python run_excel.py "path/to/file.xlsx"      # specific file
 
 Columns (strict):
@@ -19,6 +19,7 @@ Only rows with BOTH Date and Status empty are processed.
 import argparse
 import logging
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -33,6 +34,8 @@ logger = logging.getLogger("run_excel")
 
 SUBMITTED_DIR = Path(r"D:\共享云端硬盘\02 希音\Auto Pipeline\Listing - web links (submitted)")
 OUTPUT_ROOT = Path(r"D:\共享云端硬盘\02 希音\Auto Pipeline\Listing - completed 2nd")
+BACKUP_DIR = Path(r"D:\我的云端硬盘\Backup\Shein\总表")
+DEFAULT_XLSX = "Shein Submited Links.xlsx"
 DEBUG_LOG_DIR = Path(__file__).resolve().parent / "debug_logs"
 
 
@@ -60,11 +63,29 @@ def setup_logging():
     return log_path
 
 
-def find_xlsx_files() -> list[Path]:
-    """Find all .xlsx in submitted folder (exclude temp files ~$...)."""
-    if not SUBMITTED_DIR.exists():
-        return []
-    return [f for f in SUBMITTED_DIR.glob("*.xlsx") if not f.name.startswith("~$")]
+def backup_excel(xlsx_path: Path) -> None:
+    """Backup Excel to personal Drive before reading, with date suffix."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y%m%d")
+    stem = xlsx_path.stem
+    backup_name = f"{stem}_{today}.xlsx"
+    dest = BACKUP_DIR / backup_name
+    try:
+        shutil.copy2(xlsx_path, dest)
+        logger.info("Backup: %s → %s", xlsx_path.name, dest)
+    except Exception as e:
+        logger.warning("Backup failed (continuing anyway): %s", e)
+
+
+def safe_save(wb, xlsx_path: Path) -> None:
+    """Save workbook. If locked by another user, save as copy with '2' suffix."""
+    try:
+        wb.save(xlsx_path)
+    except PermissionError:
+        alt = xlsx_path.with_stem(xlsx_path.stem + "2")
+        logger.warning("Cannot save to %s (locked), saving to %s", xlsx_path.name, alt.name)
+        wb.save(alt)
+        logger.info("Saved to alternate: %s", alt.name)
 
 
 def process_excel(xlsx_path: Path) -> None:
@@ -76,6 +97,11 @@ def process_excel(xlsx_path: Path) -> None:
         ws = wb[ws_name]
         store = ws_name.strip()
         logger.info("Sheet: %s", store)
+
+        # Normalize header: accept "Execute Date" or "Date" in col C
+        header_c = str(ws.cell(1, 3).value or "").strip()
+        if header_c in ("Execute Date", ""):
+            ws.cell(1, 3).value = "Date"
 
         # Collect pending rows (Date AND Status both empty)
         pending = []
@@ -178,7 +204,7 @@ def process_excel(xlsx_path: Path) -> None:
                             f"({detail})" if detail else "")
 
         # Save after each store (so progress isn't lost)
-        wb.save(xlsx_path)
+        safe_save(wb, xlsx_path)
         logger.info("  Saved progress to %s", xlsx_path.name)
 
     wb.close()
@@ -189,7 +215,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Excel-based Shein scraper pipeline")
     parser.add_argument("file", nargs="?", default=None,
-                        help="Path to .xlsx file (default: scan submitted folder)")
+                        help="Path to .xlsx file (default: Shein Submited Links.xlsx)")
     args = parser.parse_args()
 
     setup_logging()
@@ -197,14 +223,17 @@ def main():
     if args.file:
         files = [Path(args.file)]
     else:
-        files = find_xlsx_files()
-
-    if not files:
-        logger.info("No .xlsx files found.")
-        return
+        default = SUBMITTED_DIR / DEFAULT_XLSX
+        if default.exists():
+            files = [default]
+        else:
+            logger.error("Default file not found: %s", default)
+            return
 
     for f in files:
         logger.info("=" * 60)
+        # Backup before reading
+        backup_excel(f)
         try:
             process_excel(f)
         except Exception as e:

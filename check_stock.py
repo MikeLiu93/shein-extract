@@ -28,6 +28,8 @@ from openpyxl import load_workbook
 logger = logging.getLogger("check_stock")
 
 SUBMITTED_DIR = Path(r"D:\共享云端硬盘\02 希音\Auto Pipeline\Listing - web links (submitted)")
+BACKUP_DIR = Path(r"D:\我的云端硬盘\Backup\Shein\总表")
+DEFAULT_XLSX = "Shein Submited Links.xlsx"
 DEBUG_LOG_DIR = Path(__file__).resolve().parent / "debug_logs"
 
 LOW_STOCK_THRESHOLD = 15
@@ -78,10 +80,27 @@ def setup_logging():
     logger.info("Log: %s", log_path)
 
 
-def find_xlsx_files() -> list[Path]:
-    if not SUBMITTED_DIR.exists():
-        return []
-    return [f for f in SUBMITTED_DIR.glob("*.xlsx") if not f.name.startswith("~$")]
+def backup_excel(xlsx_path: Path) -> None:
+    """Backup Excel to personal Drive before reading."""
+    import shutil
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y%m%d")
+    dest = BACKUP_DIR / f"{xlsx_path.stem}_{today}.xlsx"
+    try:
+        shutil.copy2(xlsx_path, dest)
+        logger.info("Backup: %s → %s", xlsx_path.name, dest)
+    except Exception as e:
+        logger.warning("Backup failed (continuing): %s", e)
+
+
+def safe_save(wb, xlsx_path: Path) -> None:
+    """Save workbook. If locked, save as copy with '2' suffix."""
+    try:
+        safe_save(wb, xlsx_path)
+    except PermissionError:
+        alt = xlsx_path.with_stem(xlsx_path.stem + "2")
+        logger.warning("Cannot save to %s (locked), saving to %s", xlsx_path.name, alt.name)
+        wb.save(alt)
 
 
 def _stock_label(total_stock: int | None) -> str:
@@ -195,18 +214,18 @@ def check_stock_excel(xlsx_path: Path) -> None:
 
             # Save every 10 rows
             if (idx + 1) % 10 == 0:
-                wb.save(xlsx_path)
+                safe_save(wb, xlsx_path)
                 logger.info("  Saved progress (%d/%d)", idx + 1, len(pending))
 
             # Batch pause
             if (idx + 1) % BATCH_SIZE == 0 and idx + 1 < len(pending):
                 logger.info("  Batch pause %ds...", BATCH_PAUSE_SEC)
-                wb.save(xlsx_path)
+                safe_save(wb, xlsx_path)
                 time.sleep(BATCH_PAUSE_SEC)
 
             time.sleep(DELAY_BETWEEN_PAGES)
 
-        wb.save(xlsx_path)
+        safe_save(wb, xlsx_path)
         logger.info("  Done: %s (%d checked)", store, len(pending))
 
     wb.close()
@@ -216,7 +235,7 @@ def check_stock_excel(xlsx_path: Path) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Shein stock checker")
     parser.add_argument("file", nargs="?", default=None,
-                        help="Path to .xlsx (default: scan submitted/)")
+                        help="Path to .xlsx (default: Shein Submited Links.xlsx)")
     args = parser.parse_args()
 
     setup_logging()
@@ -224,13 +243,15 @@ def main():
     if args.file:
         files = [Path(args.file)]
     else:
-        files = find_xlsx_files()
-
-    if not files:
-        logger.info("No .xlsx files found.")
-        return
+        default = SUBMITTED_DIR / DEFAULT_XLSX
+        if default.exists():
+            files = [default]
+        else:
+            logger.error("Default file not found: %s", default)
+            return
 
     for f in files:
+        backup_excel(f)
         try:
             check_stock_excel(f)
         except Exception as e:
