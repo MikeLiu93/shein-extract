@@ -101,7 +101,13 @@ def process_excel(xlsx_path: Path) -> None:
         # Run scraper
         urls = [p[2] for p in pending]
         seqs = [p[1] for p in pending]
-        xlsx_name = f"shein_products_{store}.xlsx"
+        today = datetime.now().strftime("%Y-%m-%d")
+        seq_min, seq_max = min(seqs), max(seqs)
+        xlsx_name = f"{store}-{seq_min}-{seq_max}-{today.replace('-', '')}.xlsx"
+
+        # Screenshots subfolder
+        ss_dir = store_dir / "screenshots"
+        ss_dir.mkdir(parents=True, exist_ok=True)
 
         old_cwd = Path.cwd()
         results = None
@@ -120,32 +126,48 @@ def process_excel(xlsx_path: Path) -> None:
                 pass
         finally:
             os.chdir(old_cwd)
+            # Move screenshot files into screenshots/ subfolder
+            try:
+                for f in store_dir.glob("_captcha_*"):
+                    f.rename(ss_dir / f.name)
+                for f in store_dir.glob("_block_*"):
+                    f.rename(ss_dir / f.name)
+                for f in store_dir.glob("_timeout_*"):
+                    f.rename(ss_dir / f.name)
+            except Exception:
+                pass
 
         # Update Date + Status based on results
-        today = datetime.now().strftime("%Y-%m-%d")
-
         for row_idx, seq, url in pending:
             seq_folder = store_dir / str(seq)
             has_files = seq_folder.is_dir() and any(seq_folder.iterdir())
 
-            if has_files:
+            # Determine status from result record
+            rec = None
+            if results:
+                rec = next((r for r in results if r.get("seq_num") == seq), None)
+
+            # A record with empty SKU or [goods_name] title is not a real success
+            is_bad_data = (rec and rec.get("status") == "OK"
+                           and (not rec.get("sku")
+                                or "[goods_name]" in (rec.get("title") or "")))
+
+            if has_files and not is_bad_data:
                 ws.cell(row_idx, 3).value = today
                 ws.cell(row_idx, 4).value = "Done"
                 logger.info("    seq %d → Done", seq)
-            elif results:
-                rec = next((r for r in results
-                            if r.get("seq_num") == seq), None)
-                if rec and rec.get("status") == "DELISTED":
-                    ws.cell(row_idx, 3).value = today
-                    ws.cell(row_idx, 4).value = "Delisted"
-                    logger.info("    seq %d → Delisted", seq)
-                elif rec and rec.get("status") not in ("OK", None):
-                    ws.cell(row_idx, 3).value = today
-                    ws.cell(row_idx, 4).value = "Failed"
-                    logger.info("    seq %d → Failed (%s)", seq, rec.get("status"))
-                # If rec is OK but no folder → scraper didn't get to download
-                # Leave empty so it's retried next run
-            # If results is None (crash) and no folder → leave empty for retry
+            elif rec and rec.get("status") == "DELISTED":
+                ws.cell(row_idx, 3).value = today
+                ws.cell(row_idx, 4).value = "Delisted"
+                logger.info("    seq %d → Delisted", seq)
+            else:
+                detail = rec.get("status", "") if rec else ""
+                if is_bad_data:
+                    detail = "no data loaded"
+                ws.cell(row_idx, 3).value = today
+                ws.cell(row_idx, 4).value = "Failed"
+                logger.info("    seq %d → Failed %s", seq,
+                            f"({detail})" if detail else "")
 
         # Save after each store (so progress isn't lost)
         wb.save(xlsx_path)

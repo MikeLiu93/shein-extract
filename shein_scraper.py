@@ -71,7 +71,7 @@ PAGE_LOAD_POLL_INTERVAL = 0.5     # 轮询间隔秒数
 PAGE_LOAD_RETRIES      = 3        # 遇到错误页面的最大重试次数
 RELOAD_PAUSE_SEC       = 2
 DELAY_BETWEEN_PAGES    = 2
-EXTRACTION_TIMEOUT_SEC = 240      # 单个页面提取超时（秒），超过则视为卡住
+EXTRACTION_TIMEOUT_SEC = 60       # 单个页面提取超时（秒），正常3-5s加载，超过60s视为失败
 CAPTCHA_AUTO_RETRIES   = 2        # 验证码出现时自动刷新重试次数
 RATE_LIMIT_CONSECUTIVE  = 3       # 连续失败 N 次视为限流，停止当前批次
 PICTURE_MAX_HEIGHT_PX  = 168
@@ -1069,25 +1069,77 @@ def _take_screenshot(ws_url, save_path: str) -> bool:
 CAPTCHA_AI_MAX_ATTEMPTS = 3       # AI 尝试解决验证码的最大次数
 
 _CAPTCHA_VISION_PROMPT = """\
-This is a GeeTest icon-click CAPTCHA screenshot from a SHEIN product page.
+This is a CROPPED and ENLARGED GeeTest icon-click CAPTCHA panel ({width}x{height} pixels).
 
-At the top of the CAPTCHA panel there is text "Please select the following graphics in order:" followed by 2-4 small reference icons.
+At the TOP: text "Please select the following graphics in order:" followed by 2-5 small reference icons (left to right = click order).
 
-Below that is a photo with several colored icons scattered on it. The user must click the icons in the photo that match the reference icons, in the correct left-to-right order shown at the top.
+BELOW: a photo with several colored icons scattered on it. You must find and click the matching icons IN ORDER.
 
-Tasks:
-1. Identify each reference icon at the top (describe color and shape).
-2. Find each matching icon in the photo below.
-3. Report the pixel coordinates (x, y) to click, relative to the FULL screenshot image which is {width}x{height} pixels.
+CRITICAL MATCHING RULES (learned from real captchas):
+1. THREE TYPES of captchas exist:
+   - ANIMALS/OBJECTS: helicopter, dog, butterfly, turtle, snake, kangaroo, gorilla, parrot, raccoon, squirrel, bird, crocodile, jellyfish, bread, basket, pumpkin, projector, crane, etc.
+   - DOCUMENT TYPES: icons look like colored file icons with TINY TEXT on them (FON, PDF, CSV, DOC, TXT, XLS, TGA, OTF, etc). You MUST READ THE TEXT on each icon carefully. Color/position is NOT reliable — only the text matters.
+   - PEOPLE: police officer (hat), reading girl (book+hair), nun, acrobat, etc. Match by distinctive features.
 
-Reply with ONLY valid JSON, no markdown fences, no explanation:
-{{"icons": [{{"order": 1, "description": "blue rocket", "x": 710, "y": 360}}, ...]}}"""
+2. Icons in the photo may be TRANSFORMED vs the reference:
+   - Rotated or flipped
+   - Head icon at top → full body in photo (dog head → full dog, cow head → full cow)
+   - Color may change
+   - But the IDENTITY (what animal/object it is) stays the same
+
+3. There are MORE icons in the photo than required — use ELIMINATION to help.
+
+4. Match by SEMANTIC MEANING, not by visual similarity of shape/color.
+
+5. For DOCUMENT types: zoom in mentally, READ the 2-3 letter text on EACH document icon in the photo, then match to the reference text. This is the hardest type — take extra care.
+
+Report coordinates (x, y) relative to THIS cropped image ({width}x{height} pixels).
+
+Reply with ONLY valid JSON, no markdown fences:
+{{"icons": [{{"order": 1, "description": "dog", "x": 150, "y": 280}}, ...]}}"""
+
+
+def _find_captcha_panel(pil_img):
+    """Locate the GeeTest captcha panel in a full-page screenshot.
+    Returns (left, top, right, bottom) or None."""
+    import numpy as np
+    arr = np.array(pil_img)
+    h, w = arr.shape[:2]
+
+    # The captcha panel has "Confirm" text and a dark photo area.
+    # Strategy: find the dark rectangular region in the center area of the page.
+    # The panel is typically 300-400px wide, 350-450px tall, centered horizontally.
+    gray = arr.mean(axis=2)
+
+    # Scan for a dark rectangular block (the captcha photo area)
+    best = None
+    for top in range(50, h - 200, 10):
+        for left in range(w // 4, w * 3 // 4, 10):
+            # Check a 300x250 region starting here
+            region = gray[top:top + 250, left:left + 300]
+            if region.shape[0] < 250 or region.shape[1] < 300:
+                continue
+            mean_brightness = region.mean()
+            if mean_brightness < 80:  # dark region found
+                # Expand to find full panel (include header + buttons)
+                panel_top = max(0, top - 60)
+                panel_bottom = min(h, top + 350)
+                panel_left = max(0, left - 20)
+                panel_right = min(w, left + 340)
+                if best is None or mean_brightness < best[4]:
+                    best = (panel_left, panel_top, panel_right, panel_bottom, mean_brightness)
+    if best:
+        return best[:4]
+    # Fallback: center crop
+    cx, cy = w // 2, h // 2
+    return (cx - 200, cy - 220, cx + 200, cy + 200)
 
 
 def _solve_captcha_ai(port, tab_id) -> bool:
     """
     Attempt to solve a GeeTest icon-click CAPTCHA using Claude Vision API.
-    Takes a CDP screenshot, sends to API, clicks icons in order, then clicks Confirm.
+    Crops and enlarges the captcha panel for better accuracy, then
+    translates coordinates back to full-page for CDP clicking.
     Returns True if solved, False otherwise.
     """
     import base64 as _b64
@@ -1106,32 +1158,55 @@ def _solve_captcha_ai(port, tab_id) -> bool:
         # 1. Take CDP screenshot (full viewport)
         try:
             res = _cdp_once(ws_url, "Page.captureScreenshot", {"format": "png"}, timeout=15)
-            img_b64 = res.get("data")
-            if not img_b64:
+            img_b64_full = res.get("data")
+            if not img_b64_full:
                 print("  [AI验证] 截图失败")
                 return False
         except Exception as e:
             print(f"  [AI验证] 截图异常: {e}")
             return False
 
-        # Get image dimensions
+        # 2. Crop captcha panel and enlarge 2x
         try:
             import io
             from PIL import Image as _PILImage
-            img_bytes = _b64.b64decode(img_b64)
-            _pil = _PILImage.open(io.BytesIO(img_bytes))
-            img_w, img_h = _pil.size
-        except Exception:
-            img_w, img_h = 1920, 1080  # fallback
+            img_bytes_full = _b64.b64decode(img_b64_full)
+            full_img = _PILImage.open(io.BytesIO(img_bytes_full))
+            full_w, full_h = full_img.size
 
-        # Save screenshot for debugging
+            panel_box = _find_captcha_panel(full_img)
+            crop_left, crop_top, crop_right, crop_bottom = panel_box
+            cropped = full_img.crop(panel_box)
+
+            # Enlarge 2x for better text readability
+            scale = 2
+            enlarged = cropped.resize(
+                (cropped.width * scale, cropped.height * scale),
+                _PILImage.LANCZOS)
+
+            # Encode enlarged image
+            buf = io.BytesIO()
+            enlarged.save(buf, format="PNG")
+            img_b64 = _b64.b64encode(buf.getvalue()).decode()
+            crop_w, crop_h = enlarged.size
+            print(f"  [AI验证] 裁剪区域: ({crop_left},{crop_top})-({crop_right},{crop_bottom}), 放大{scale}x → {crop_w}x{crop_h}")
+        except Exception as e:
+            print(f"  [AI验证] 裁剪失败，使用全图: {e}")
+            img_b64 = img_b64_full
+            crop_left, crop_top, scale = 0, 0, 1
+            crop_w, crop_h = full_w, full_h
+
+        # Save debug images
         try:
-            ss_path = Path(base_dir) / f"_captcha_ai_attempt_{attempt + 1}.png"
-            ss_path.write_bytes(img_bytes)
+            base_dir_path = Path.cwd()
+            Path(base_dir_path / f"_captcha_ai_attempt_{attempt + 1}_full.png").write_bytes(img_bytes_full)
+            buf2 = io.BytesIO()
+            enlarged.save(buf2, format="PNG")
+            Path(base_dir_path / f"_captcha_ai_attempt_{attempt + 1}_cropped.png").write_bytes(buf2.getvalue())
         except Exception:
             pass
 
-        # 2. Send to Claude Vision API
+        # 3. Send cropped+enlarged image to Claude Vision API
         try:
             resp = requests.post(
                 "https://api.anthropic.com/v1/messages",
@@ -1149,7 +1224,7 @@ def _solve_captcha_ai(port, tab_id) -> bool:
                             {"type": "image", "source": {
                                 "type": "base64", "media_type": "image/png", "data": img_b64}},
                             {"type": "text", "text": _CAPTCHA_VISION_PROMPT.format(
-                                width=img_w, height=img_h)},
+                                width=crop_w, height=crop_h)},
                         ],
                     }],
                 },
@@ -1181,10 +1256,15 @@ def _solve_captcha_ai(port, tab_id) -> bool:
             continue
 
         # 4. Click icons in order via CDP (with human-like delays)
+        #    Translate coordinates: cropped+enlarged → full page
         try:
             ws_url = _ws_url_for_id(port, tab_id)
             for ic in icons:
-                x, y = float(ic["x"]), float(ic["y"])
+                # API returns coords relative to cropped+enlarged image
+                cx, cy = float(ic["x"]), float(ic["y"])
+                # Reverse: divide by scale, add crop offset → full page coords
+                x = cx / scale + crop_left
+                y = cy / scale + crop_top
                 # Small random offset (+-3px) for human-like behavior
                 x += random.uniform(-3, 3)
                 y += random.uniform(-3, 3)
