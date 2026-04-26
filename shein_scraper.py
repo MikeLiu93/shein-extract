@@ -1814,19 +1814,28 @@ def _save_excel(records, path):
 
     def renumber_rows(ws, recs) -> None:
         # 用 rec 里的 seq_num（如有），否则 fallback 到行号
-        # 变体子行（SKU 为空）No. 留空
-        rec_map = {}
+        # 变体子行（SKU 为空且 URL 也为空）No. 留空
+        sku_seq = {}
+        url_seq = {}
         for rc in recs:
             sn = str(rc.get("sku") or "").strip()
             if sn:
-                rec_map[sn] = rc.get("seq_num")
+                sku_seq[sn] = rc.get("seq_num")
+            url = str(rc.get("url") or "").strip()
+            if url and rc.get("seq_num") is not None:
+                url_seq[url] = rc.get("seq_num")
         for r in range(2, ws.max_row + 1):
             sku_val = str(ws.cell(r, 3).value or "").strip()
-            if not sku_val:
+            url_val = str(ws.cell(r, 7).value or "").strip()
+            if sku_val:
+                seq = sku_seq.get(sku_val)
+                ws.cell(r, 1, seq if seq is not None else r - 1)
+            elif url_val:
+                # Failed record: no SKU but has URL → match by URL
+                seq = url_seq.get(url_val)
+                ws.cell(r, 1, seq if seq is not None else "")
+            else:
                 ws.cell(r, 1, "")  # 变体子行：No. 留空
-                continue
-            seq = rec_map.get(sku_val)
-            ws.cell(r, 1, seq if seq is not None else r - 1)
 
     def existing_skus(ws) -> set[str]:
         skus = set()
@@ -1967,6 +1976,11 @@ def _save_excel(records, path):
                     _add_picture_to_cell(ws, target_row, PICTURE_COL, Path(str(pic_path)))
                 )
             ws.row_dimensions[target_row].height = max(18, int(max(base_text_pt, img_pt)))
+
+        # Write seq_num to No. column immediately (don't rely on renumber_rows)
+        seq_num = rec.get("seq_num")
+        if seq_num is not None and not is_variant:
+            ws.cell(target_row, 1, seq_num)
 
     renumber_rows(ws, records)
     wb.save(path)
@@ -2650,7 +2664,11 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
                     _st.url_progress(done=i - 1, total=len(urls), current_url=url)
                 except Exception:
                     pass
-            rec = {"url": url, "status": "OK"}
+            rec = {
+                "url": url,
+                "status": "OK",
+                "seq_num": seq_list[i - 1] if seq_list else start_seq + (i - 1),
+            }
             tab_id = None
             _url_start_time = time.monotonic()
             try:
@@ -2667,20 +2685,31 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
                         time.sleep(DELAY_BETWEEN_PAGES)
                     continue
 
-                # 检测商品下架/404（Oops 页面）— 不计入连续失败
+                # 检测商品下架/404（Oops 页面）或数据未加载（[goods_name]）
                 try:
-                    _is_oops = _run_js(ws_url, """
-                        document.body && (
-                            document.body.innerText.includes('Oops') ||
-                            document.querySelector('.page-not-found, .error-page, [class*="not-found"]') !== null
-                        )
+                    _page_check = _run_js(ws_url, """
+                        (function() {
+                            if (document.body && (
+                                document.body.innerText.includes('Oops') ||
+                                document.querySelector('.page-not-found, .error-page, [class*="not-found"]')
+                            )) return 'OOPS';
+                            if (document.title && document.title.includes('[goods_name]'))
+                                return 'NO_DATA';
+                            return 'OK';
+                        })()
                     """)
-                    if _is_oops:
+                    if _page_check == "OOPS":
                         rec["status"] = "DELISTED"
-                        rec["seq_num"] = seq_list[i - 1] if seq_list else start_seq + (i - 1)
                         print("  [跳过] 商品已下架 (Oops 404)")
                         records.append(rec)
-                        _consecutive_fails = 0  # 下架不算限流
+                        _consecutive_fails = 0
+                        if i < len(urls):
+                            time.sleep(DELAY_BETWEEN_PAGES)
+                        continue
+                    if _page_check == "NO_DATA":
+                        rec["status"] = "NO_DATA"
+                        print("  [跳过] 页面数据未加载 ([goods_name])")
+                        records.append(rec)
                         if i < len(urls):
                             time.sleep(DELAY_BETWEEN_PAGES)
                         continue

@@ -112,7 +112,15 @@ def process_excel(xlsx_path: Path) -> None:
         old_cwd = Path.cwd()
         results = None
         try:
-            os.chdir(store_dir)
+            # Google Drive sync may briefly lock new folders
+            for _retry in range(5):
+                try:
+                    os.chdir(store_dir)
+                    break
+                except PermissionError:
+                    time.sleep(2)
+            else:
+                os.chdir(store_dir)  # final attempt, let it raise
             logger.info("  Scraping %d URLs → %s/%s", len(urls), store, xlsx_name)
             results = scrape_shein(urls, output=xlsx_name, seq_list=seqs)
         except RateLimitError:
