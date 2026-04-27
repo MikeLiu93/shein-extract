@@ -64,7 +64,7 @@ def alert_captcha(url: str, screenshot_path: str | None = None) -> bool:
     """验证码拦截告警"""
     return send_alert(
         subject="⚠ Shein 爬虫被验证码拦截",
-        body=f"爬虫在以下页面遇到验证码/人机验证，5分钟内未能自动绕过，需要人工处理。\n\n页面: {url}",
+        body=f"爬虫在以下页面遇到验证码/人机验证，需要你手动处理（爬虫会等待最多 5 分钟）。\n\n页面: {url}",
         screenshot_path=screenshot_path,
     )
 
