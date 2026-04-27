@@ -10,10 +10,12 @@ from email.mime.image import MIMEImage
 from pathlib import Path
 from datetime import datetime
 
+import config  # noqa: F401 — side effect: loads .env into os.environ
+
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 GMAIL_USER = "dracarys001mike@gmail.com"
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "cwde kuik qngh gsgu")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 NOTIFY_TO = "dracarys001mike@gmail.com"  # 收件人（可以和发件人一样）
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587

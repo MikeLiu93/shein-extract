@@ -25,10 +25,9 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-logger = logging.getLogger("check_stock")
+from config import SUBMITTED_DIR, BACKUP_DIR
 
-SUBMITTED_DIR = Path(r"D:\共享云端硬盘\02 希音\Auto Pipeline\Listing - web links (submitted)")
-BACKUP_DIR = Path(r"D:\我的云端硬盘\Backup\Shein\总表")
+logger = logging.getLogger("check_stock")
 DEFAULT_XLSX = "Shein Submited Links.xlsx"
 DEBUG_LOG_DIR = Path(__file__).resolve().parent / "debug_logs"
 

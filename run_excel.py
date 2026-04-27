@@ -29,12 +29,9 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from shein_scraper import scrape_shein, RateLimitError
+from config import SUBMITTED_DIR, OUTPUT_ROOT_2ND as OUTPUT_ROOT, BACKUP_DIR
 
 logger = logging.getLogger("run_excel")
-
-SUBMITTED_DIR = Path(r"D:\共享云端硬盘\02 希音\Auto Pipeline\Listing - web links (submitted)")
-OUTPUT_ROOT = Path(r"D:\共享云端硬盘\02 希音\Auto Pipeline\Listing - completed 2nd")
-BACKUP_DIR = Path(r"D:\我的云端硬盘\Backup\Shein\总表")
 DEFAULT_XLSX = "Shein Submited Links.xlsx"
 DEBUG_LOG_DIR = Path(__file__).resolve().parent / "debug_logs"
 
