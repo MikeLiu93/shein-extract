@@ -43,13 +43,11 @@ Plus a lightweight **Stock Checker** for monitoring inventory.
 | **run_excel.py** | Excel pipeline — read pending URLs, scrape, write Date+Status back |
 | **check_stock.py** | Stock checker — lightweight, Done URLs only, no image download |
 | **shein_scraper.py** | Core scraper — Chrome CDP, data extraction, Excel output, AI titles |
-| **take_orders_worker.py** | Legacy TXT pipeline — .txt intake (still works but not primary) |
 | **state_tracker.py** | Heartbeat writer — `state/state.json` + `state/events.jsonl` |
 | **dashboard.py** | Local web UI at `:5055` — health/progress/log tail |
 | **notify.py** | Email alerts via Gmail SMTP — captcha, login, errors |
 | **merge_store_reports.py** | Weekly Excel merge — dedup by seq, embed images |
 | **run_excel.cmd** | Double-click to run Excel pipeline |
-| **run.cmd** | Double-click to run legacy TXT pipeline |
 | **run_dashboard.cmd** | Start dashboard |
 
 ---

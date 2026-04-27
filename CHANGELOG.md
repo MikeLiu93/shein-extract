@@ -1,5 +1,10 @@
 # Shein Product Scraper - CHANGELOG
 
+## v3.1 — 2026-04-27
+- **退役老 .txt 流程**: 删除 `take_orders_worker.py` / `run_scheduled.cmd` / `run.cmd` / `run_once_from_txt.py` / `setup_schedule.ps1` / `_register_task.ps1` / `_register_merge_task.ps1` / `SheinTask.xml`
+- **Windows 计划任务清理**: `SheinListing-TakeOrders` 和 `SheinListing-WeeklyMerge` 已 unregister（之前每天 14:00/20:00 触发老 worker，并误建 `Listing - web links (processed)` / `(failed)` 文件夹）
+- **统一入口**: 唯一活跃流程为 `run_excel.py`（Excel 提交），Date/Status 写回输入 Excel，不再产生 processed/failed 文件夹
+
 ## v3.0 — 2026-04-26
 - **Excel 管道 (run_excel.py)**: 从 TXT 输入切换到 Excel 输入（worksheet = 店铺），显式 Seq 列，Date/Status 自动回写
 - **库存检查 (check_stock.py)**: 轻量脚本，只加载页面提取库存，不下载图片。~8s/URL，1000 条约 2-4 小时
