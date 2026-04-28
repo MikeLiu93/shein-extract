@@ -133,7 +133,7 @@ _JS_SCROLL_GALLERY = r"""
 # ── JavaScript: 检测登录/验证码拦截 ──────────────────────────────────────────
 _JS_DETECT_BLOCK = r"""
 (function(){
-    var result = {blocked: false, type: null};
+    var result = {blocked: false, type: null, rect: null};
     var bodyText = (document.body?.innerText || '').toLowerCase();
     var html = document.documentElement?.innerHTML || '';
 
@@ -170,8 +170,10 @@ _JS_DETECT_BLOCK = r"""
     for (var i = 0; i < captchaSelectors.length; i++) {
         var el = document.querySelector(captchaSelectors[i]);
         if (el && el.offsetHeight > 30) {
+            var r = el.getBoundingClientRect();
             result.blocked = true;
             result.type = 'captcha';
+            result.rect = {x: r.left, y: r.top, w: r.width, h: r.height};
             return result;
         }
     }
@@ -1051,11 +1053,20 @@ def _reload_tab_and_wait(port, tab_id):
     return _ws_url_for_id(port, tab_id)
 
 
-def _take_screenshot(ws_url, save_path: str) -> bool:
-    """通过 CDP 截图并保存为 PNG。"""
+def _take_screenshot(ws_url, save_path: str, clip_rect=None) -> bool:
+    """通过 CDP 截图并保存为 PNG。clip_rect={x,y,w,h} 时只截该矩形（带 10px padding）。"""
     try:
         import base64
-        res = _cdp_once(ws_url, "Page.captureScreenshot", {"format": "png"}, timeout=15)
+        params = {"format": "png"}
+        if clip_rect:
+            pad = 10
+            x = max(0.0, float(clip_rect.get("x", 0)) - pad)
+            y = max(0.0, float(clip_rect.get("y", 0)) - pad)
+            w = float(clip_rect.get("w", 0)) + pad * 2
+            h = float(clip_rect.get("h", 0)) + pad * 2
+            if w > 0 and h > 0:
+                params["clip"] = {"x": x, "y": y, "width": w, "height": h, "scale": 1}
+        res = _cdp_once(ws_url, "Page.captureScreenshot", params, timeout=15)
         data_b64 = res.get("data")
         if data_b64:
             Path(save_path).write_bytes(base64.b64decode(data_b64))
@@ -1063,6 +1074,13 @@ def _take_screenshot(ws_url, save_path: str) -> bool:
     except Exception as e:
         print(f"  [截图失败] {e}")
     return False
+
+
+def _screenshots_dir(base_dir) -> Path:
+    """Ensure screenshots/ subfolder under base_dir; return its path."""
+    d = Path(base_dir) / "screenshots"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _check_and_handle_block(port, tab_id, url, base_dir, max_wait=300):
@@ -1102,7 +1120,7 @@ def _check_and_handle_block(port, tab_id, url, base_dir, max_wait=300):
                 pass
         # 3 次尝试失败，截图 + 通知
         print("  [拦截处理] 登录弹窗关闭失败，发送通知...")
-        ss_path = str(Path(base_dir) / "_block_screenshot.png")
+        ss_path = str(_screenshots_dir(base_dir) / f"_block_{time.strftime('%Y%m%d_%H%M%S')}.png")
         try:
             ws_url = _ws_url_for_id(port, tab_id)
             _take_screenshot(ws_url, ss_path)
@@ -1114,10 +1132,10 @@ def _check_and_handle_block(port, tab_id, url, base_dir, max_wait=300):
     # ── 验证码：立即邮件通知，等待人工解决（不自动绕过） ──
     if "captcha" in block_type:
         print(f"  [拦截处理] 检测到人机验证，发送邮件通知，等待人工（最多 {max_wait}s）...")
-        ss_path = str(Path(base_dir) / "_block_screenshot.png")
+        ss_path = str(_screenshots_dir(base_dir) / f"_captcha_{time.strftime('%Y%m%d_%H%M%S')}.png")
         try:
             ws_url = _ws_url_for_id(port, tab_id)
-            _take_screenshot(ws_url, ss_path)
+            _take_screenshot(ws_url, ss_path, clip_rect=result.get("rect"))
         except Exception:
             ss_path = None
         alert_captcha(url, screenshot_path=ss_path)
@@ -2382,6 +2400,8 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
                     if i < len(urls):
                         time.sleep(DELAY_BETWEEN_PAGES)
                     continue
+                # 重置提取超时计时器：拦截处理（尤其验证码）可能耗时数分钟
+                _url_start_time = time.monotonic()
 
                 # 检测商品下架/404（Oops 页面）或数据未加载（[goods_name]）
                 try:
@@ -2436,7 +2456,7 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
                         except Exception:
                             pass
                         # 无论是否检测到验证码，都截图通知
-                        ss_path = str(Path(base_dir) / "_timeout_screenshot.png")
+                        ss_path = str(_screenshots_dir(base_dir) / f"_timeout_{time.strftime('%Y%m%d_%H%M%S')}.png")
                         try:
                             ws_url = _ws_url_for_id(CDP_PORT, tab_id)
                             _take_screenshot(ws_url, ss_path)
