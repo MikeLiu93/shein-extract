@@ -128,10 +128,7 @@ def process_excel(xlsx_path: Path) -> None:
         seq_min, seq_max = min(seqs), max(seqs)
         xlsx_name = f"{store}-{seq_min}-{seq_max}-{today.replace('-', '')}.xlsx"
 
-        # Screenshots subfolder
-        ss_dir = store_dir / "screenshots"
-        ss_dir.mkdir(parents=True, exist_ok=True)
-
+        # screenshots/ subfolder is created lazily by the scraper itself
         old_cwd = Path.cwd()
         results = None
         try:
@@ -157,16 +154,6 @@ def process_excel(xlsx_path: Path) -> None:
                 pass
         finally:
             os.chdir(old_cwd)
-            # Move screenshot files into screenshots/ subfolder
-            try:
-                for f in store_dir.glob("_captcha_*"):
-                    f.rename(ss_dir / f.name)
-                for f in store_dir.glob("_block_*"):
-                    f.rename(ss_dir / f.name)
-                for f in store_dir.glob("_timeout_*"):
-                    f.rename(ss_dir / f.name)
-            except Exception:
-                pass
 
         # Update Date + Status based on results
         for row_idx, seq, url in pending:
