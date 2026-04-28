@@ -1,5 +1,10 @@
 # Shein Product Scraper - CHANGELOG
 
+## v3.2 — 2026-04-28
+- **OOPS 退避重试**: 检测到 "Oops" 页面后先退避 30-60s 再重试一次，仍 OOPS 才判 DELISTED。原因：Shein 软封禁经常返回 Oops 假页面，立即标 DELISTED 会误杀真商品（同 URL 你自己点开正常显示）。
+- **随机化间隔**: `DELAY_BETWEEN_PAGES = 2`（固定）改成每个商品间随机 4-12s + 每 18 个商品插一次 30-90s 长歇。新 helper `_inter_url_pause(i, total)` 替换所有原来的 `time.sleep(DELAY_BETWEEN_PAGES)`。代价：1000 条耗时约从 3h 增到 6h；收益：行为评分下降一档。
+- **未来工作**: 见 `FUTURE_WORK.md` —— 更强 stealth JS、warmup 升级、周期性假浏览。
+
 ## v3.1 — 2026-04-27
 - **退役老 .txt 流程**: 删除 `take_orders_worker.py` / `run_scheduled.cmd` / `run.cmd` / `run_once_from_txt.py` / `setup_schedule.ps1` / `_register_task.ps1` / `_register_merge_task.ps1` / `SheinTask.xml`
 - **Windows 计划任务清理**: `SheinListing-TakeOrders` 和 `SheinListing-WeeklyMerge` 已 unregister（之前每天 14:00/20:00 触发老 worker，并误建 `Listing - web links (processed)` / `(failed)` 文件夹）
