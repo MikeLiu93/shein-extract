@@ -1,0 +1,37 @@
+# Secrets
+.env
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime state
+state/
+debug_logs/
+logs/
+*.log
+
+# Claude Code local settings
+.claude/
+
+# Test runs / scratch
+_test_run/
+_smoke.py
+_inspect_*.py
+exam pics/
