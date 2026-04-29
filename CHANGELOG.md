@@ -1,5 +1,10 @@
 # Shein Product Scraper - CHANGELOG
 
+## v3.3 — 2026-04-29
+- **修复 Senmeo 等小店 URL 触发 Oops 假页面**: `_navigate_and_wait` 从 `window.location.href` 改回 `Page.navigate(url, referrer="", transitionType="typed")`，等同于地址栏粘贴，不发 Referer。Shein 的反爬会对账 URL 里的 `src_identifier=...thirdPartyStoreHome...` 与实际 Referer，不一致就发 Oops；空 Referer 则跳过对账。
+- **保留**：仍是单 tab 复用（v3.0 引入），不退回"每个 URL 新 tab"模式（那个会触发 API 限流）。
+- **诊断 log**：每次导航后打印 `document.referrer` 实际值，方便确认是否真的发空。
+
 ## v3.2 — 2026-04-28
 - **OOPS 退避重试**: 检测到 "Oops" 页面后先退避 30-60s 再重试一次，仍 OOPS 才判 DELISTED。原因：Shein 软封禁经常返回 Oops 假页面，立即标 DELISTED 会误杀真商品（同 URL 你自己点开正常显示）。
 - **随机化间隔**: `DELAY_BETWEEN_PAGES = 2`（固定）改成每个商品间随机 4-12s + 每 18 个商品插一次 30-90s 长歇。新 helper `_inter_url_pause(i, total)` 替换所有原来的 `time.sleep(DELAY_BETWEEN_PAGES)`。代价：1000 条耗时约从 3h 增到 6h；收益：行为评分下降一档。

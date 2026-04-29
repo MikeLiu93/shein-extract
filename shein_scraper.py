@@ -1046,18 +1046,25 @@ def _ensure_shein_tab(port):
 
 def _navigate_and_wait(port, url):
     """
-    Reuse a single tab, navigate via JS (window.location.href) to mimic
-    in-site clicking. Waits for goods_sn to appear.
+    Reuse a single tab, navigate via CDP Page.navigate with empty referrer
+    (mimics address-bar typed URL). Avoids Referer-mismatch soft-blocks
+    where Shein returns "Oops" because the URL's tracking params claim a
+    source page that doesn't match the actual Referer.
     Returns (ws_url, tab_id).
     """
     tab_id, ws_url = _ensure_shein_tab(port)
 
-    # Navigate via JS — identical to clicking a link on the page
-    _run_js(ws_url, f'window.location.href = "{url}";')
+    # Empty referrer + transitionType "typed" = address-bar paste pattern.
+    print(f"  [导航] Page.navigate (referrer='') → {url[:90]}")
+    _cdp_once(ws_url, "Page.navigate", {
+        "url": url,
+        "referrer": "",
+        "transitionType": "typed",
+    })
 
     # Wait for navigation to start, then poll for page ready
     time.sleep(1)
-    # After JS navigation, ws_url changes — poll until tab is available again
+    # After navigation, ws_url may change — poll until tab is available again
     for _ in range(10):
         try:
             ws_url = _ws_url_for_id(port, tab_id)
@@ -1065,9 +1072,17 @@ def _navigate_and_wait(port, url):
         except Exception:
             time.sleep(0.5)
     else:
-        raise RuntimeError(f"Tab {tab_id} lost after JS navigation")
+        raise RuntimeError(f"Tab {tab_id} lost after navigation")
 
     _, ws_url = _wait_for_page_ready(port, tab_id)
+
+    # Diagnostic: print actual Referer Chrome sent (should be empty)
+    try:
+        actual_ref = _run_js(ws_url, "document.referrer")
+        print(f"  [导航] document.referrer = '{actual_ref}'")
+    except Exception:
+        pass
+
     return _ws_url_for_id(port, tab_id), tab_id
 
 
