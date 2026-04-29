@@ -990,81 +990,80 @@ if (!window.chrome) { window.chrome = {}; }
 if (!window.chrome.runtime) { window.chrome.runtime = {}; }
 """
 
-# Reusable tab ID — navigate the same tab instead of opening new ones
-_REUSE_TAB_ID: str | None = None
+# Whether session warmup (homepage visit) has been done in this process
+_SESSION_WARMED: bool = False
 
 
-def _ensure_shein_tab(port):
+def _ensure_shein_session(port):
     """
-    Ensure we have a reusable Shein tab. On first call, navigate an existing tab
-    to the Shein homepage to warm up cookies/session. Returns (tab_id, ws_url).
+    On first call, ensure cookies/session are warm by visiting Shein homepage.
+    Idempotent: subsequent calls are no-ops within the same process.
     """
-    global _REUSE_TAB_ID
+    global _SESSION_WARMED
+    if _SESSION_WARMED:
+        return
 
-    # Check if our reusable tab still exists
-    if _REUSE_TAB_ID:
-        try:
-            ws_url = _ws_url_for_id(port, _REUSE_TAB_ID)
-            return _REUSE_TAB_ID, ws_url
-        except Exception:
-            _REUSE_TAB_ID = None
-
-    # Find an existing Shein page tab or any page tab
     tabs = requests.get(f"http://localhost:{port}/json", timeout=5).json()
     pages = [t for t in tabs if t.get("type") == "page"]
     shein_pages = [t for t in pages if "shein.com" in (t.get("url") or "")]
 
+    # If a Shein page already exists from a previous run, treat session as warm
     if shein_pages:
-        tab = shein_pages[0]
-    elif pages:
+        _SESSION_WARMED = True
+        return
+
+    # Otherwise, do warmup in any existing tab (or create one)
+    if pages:
         tab = pages[0]
     else:
         tab = requests.put(f"http://localhost:{port}/json/new", timeout=5).json()
+    ws_url = tab.get("webSocketDebuggerUrl") or _ws_url_for_id(port, tab["id"])
 
-    _REUSE_TAB_ID = tab["id"]
-    ws_url = tab.get("webSocketDebuggerUrl") or _ws_url_for_id(port, _REUSE_TAB_ID)
-
-    # Inject anti-detection
     try:
         _cdp_once(ws_url, "Page.addScriptToEvaluateOnNewDocument",
                   {"source": _JS_ANTI_DETECT})
     except Exception:
         pass
 
-    # If not already on a Shein page, warm up by visiting homepage
-    cur_url = tab.get("url", "")
-    if "shein.com" not in cur_url:
-        print("  [导航] 预热：先访问 Shein 首页建立 session...")
-        _cdp_once(ws_url, "Page.navigate", {
-            "url": _SHEIN_REFERRER,
-            "transitionType": "typed",
-        })
-        time.sleep(5)
-
-    return _REUSE_TAB_ID, _ws_url_for_id(port, _REUSE_TAB_ID)
+    print("  [导航] 预热：先访问 Shein 首页建立 session...")
+    _cdp_once(ws_url, "Page.navigate", {
+        "url": _SHEIN_REFERRER,
+        "referrer": "",
+        "transitionType": "typed",
+    })
+    time.sleep(5)
+    _SESSION_WARMED = True
 
 
 def _navigate_and_wait(port, url):
     """
-    Reuse a single tab, navigate via CDP Page.navigate with empty referrer
-    (mimics address-bar typed URL). Avoids Referer-mismatch soft-blocks
-    where Shein returns "Oops" because the URL's tracking params claim a
-    source page that doesn't match the actual Referer.
+    Open a fresh tab, navigate via Page.navigate(referrer="") — equivalent to
+    the user opening a new tab and pasting the URL into the address bar.
+    The scrape loop closes the tab in its finally clause after extraction.
     Returns (ws_url, tab_id).
     """
-    tab_id, ws_url = _ensure_shein_tab(port)
+    _ensure_shein_session(port)
 
-    # Empty referrer + transitionType "typed" = address-bar paste pattern.
-    print(f"  [导航] Page.navigate (referrer='') → {url[:90]}")
+    tab_id, ws_url = _new_tab(port)
+    if not tab_id or not ws_url:
+        raise RuntimeError("Failed to create new tab via /json/new")
+
+    # Inject anti-detection BEFORE navigation
+    try:
+        _cdp_once(ws_url, "Page.addScriptToEvaluateOnNewDocument",
+                  {"source": _JS_ANTI_DETECT})
+    except Exception:
+        pass
+
+    # Empty referrer + transitionType "typed" = address-bar paste in a new tab.
+    print(f"  [导航] 新 tab + Page.navigate (referrer='') → {url[:90]}")
     _cdp_once(ws_url, "Page.navigate", {
         "url": url,
         "referrer": "",
         "transitionType": "typed",
     })
 
-    # Wait for navigation to start, then poll for page ready
     time.sleep(1)
-    # After navigation, ws_url may change — poll until tab is available again
     for _ in range(10):
         try:
             ws_url = _ws_url_for_id(port, tab_id)
@@ -2543,10 +2542,8 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
                 if rec.get("status") == "TIMEOUT":
                     print("  [跳过] 页面超时")
                     records.append(rec)
-                    if tab_id is not None:
-                        _close_tab(CDP_PORT, tab_id)
                     _inter_url_pause(i, len(urls))
-                    continue
+                    continue  # tab closed by finally
 
                 if not isinstance(data, dict):
                     raise ValueError("JS returned unexpected type — page may not have loaded")
@@ -2655,7 +2652,9 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
                 rec["status"] = f"ERROR: {e}"
                 print(f"  ERROR: {e}")
             finally:
-                pass  # Tab is reused across URLs; do not close
+                # Each URL got its own tab — close it to avoid Chrome accumulation
+                if tab_id is not None:
+                    _close_tab(CDP_PORT, tab_id)
 
             records.append(rec)
 

@@ -1,5 +1,12 @@
 # Shein Product Scraper - CHANGELOG
 
+## v3.4 — 2026-04-29
+- **每个 URL 开新 tab + 粘贴模式**：彻底等同于"用户手动新建 tab + 地址栏粘贴 URL + 回车"。`_navigate_and_wait` 现在每条 URL 调用 `_new_tab(port)` 开新 tab，再用 `Page.navigate(url, referrer="", transitionType="typed")` 加载，scrape 完成后在 finally 块关闭 tab。
+- **保留 v3.3 的空 Referer**：每个新 tab 的导航都不发 Referer，仍能避开 Shein 的 src_identifier vs Referer 对账软封禁（OOPS 假页面）。
+- **缓解 v3.0 之前的"新 tab 风暴"风险**：v3.2 引入的随机 4-12s 间隔 + 每 18 条长歇 30-90s 已经把"开 tab 频率"压到接近真人节奏，不会触发原来 commit 2ac56f5 担心的 API 限流。
+- **session 预热重构**：`_ensure_shein_tab`（拿一个可复用 tab）→ `_ensure_shein_session`（只确保首页访问过、cookies 暖了）。预热 tab 不关闭，做"session 锚点"。
+- **Tab 清理**：scrape 主循环 finally 块统一关 tab；移除 TIMEOUT 分支里冗余的 close 调用。
+
 ## v3.3 — 2026-04-29
 - **修复 Senmeo 等小店 URL 触发 Oops 假页面**: `_navigate_and_wait` 从 `window.location.href` 改回 `Page.navigate(url, referrer="", transitionType="typed")`，等同于地址栏粘贴，不发 Referer。Shein 的反爬会对账 URL 里的 `src_identifier=...thirdPartyStoreHome...` 与实际 Referer，不一致就发 Oops；空 Referer 则跳过对账。
 - **保留**：仍是单 tab 复用（v3.0 引入），不退回"每个 URL 新 tab"模式（那个会触发 API 限流）。
