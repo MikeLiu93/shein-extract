@@ -1,5 +1,10 @@
 # Shein Product Scraper - CHANGELOG
 
+## v3.4.1 — 2026-04-29
+- **修复 v3.4 的 Page.navigate 不生效**: `Page.navigate(url, referrer="")` 被 Chrome 解析为"空字符串作为 Referer URL"，整个 navigate 命令被吞掉，新 tab 卡在 `chrome://newtab/` 不动。
+- **改用 `PUT /json/new?<url>`**: CDP 原生支持，单步完成"开新 tab + 加载 URL"，等同于用户地址栏粘贴。`_new_tab(port, url=None)` 加 url 参数，URL 用 `urllib.parse.quote` 转义。
+- **`_navigate_and_wait` 简化**: 不再需要 `Page.addScriptToEvaluateOnNewDocument` + `Page.navigate` 两步。anti-detect 暂时去掉（仅 3 行 mask `navigator.webdriver` 等，Chrome 启动参数 `--disable-blink-features=AutomationControlled` 已经覆盖大部分），如果 captcha 频率上升再加回来。
+
 ## v3.4 — 2026-04-29
 - **每个 URL 开新 tab + 粘贴模式**：彻底等同于"用户手动新建 tab + 地址栏粘贴 URL + 回车"。`_navigate_and_wait` 现在每条 URL 调用 `_new_tab(port)` 开新 tab，再用 `Page.navigate(url, referrer="", transitionType="typed")` 加载，scrape 完成后在 finally 块关闭 tab。
 - **保留 v3.3 的空 Referer**：每个新 tab 的导航都不发 Referer，仍能避开 Shein 的 src_identifier vs Referer 对账软封禁（OOPS 假页面）。

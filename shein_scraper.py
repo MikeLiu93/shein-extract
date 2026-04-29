@@ -922,8 +922,14 @@ def _get_ws_url(port=CDP_PORT):
     return pages[0]["webSocketDebuggerUrl"]
 
 
-def _new_tab(port=CDP_PORT):
-    tab = requests.put(f"http://localhost:{port}/json/new", timeout=5).json()
+def _new_tab(port=CDP_PORT, url=None):
+    """Create a new tab. If url given, opens directly at that URL — equivalent
+    to user typing the URL into a fresh tab's address bar (no Referer)."""
+    endpoint = f"http://localhost:{port}/json/new"
+    if url:
+        from urllib.parse import quote
+        endpoint += "?" + quote(url, safe="")
+    tab = requests.put(endpoint, timeout=5).json()
     return tab.get("id"), tab.get("webSocketDebuggerUrl")
 
 
@@ -1037,31 +1043,18 @@ def _ensure_shein_session(port):
 
 def _navigate_and_wait(port, url):
     """
-    Open a fresh tab, navigate via Page.navigate(referrer="") — equivalent to
-    the user opening a new tab and pasting the URL into the address bar.
+    Open a fresh tab DIRECTLY at the target URL via PUT /json/new?<url>.
+    Single-step equivalent of "user opens new tab + pastes URL + Enter".
+    No Page.navigate, no Referer, no chance of empty-referrer weirdness.
     The scrape loop closes the tab in its finally clause after extraction.
     Returns (ws_url, tab_id).
     """
     _ensure_shein_session(port)
 
-    tab_id, ws_url = _new_tab(port)
+    print(f"  [导航] 新 tab @ URL → {url[:90]}")
+    tab_id, ws_url = _new_tab(port, url=url)
     if not tab_id or not ws_url:
-        raise RuntimeError("Failed to create new tab via /json/new")
-
-    # Inject anti-detection BEFORE navigation
-    try:
-        _cdp_once(ws_url, "Page.addScriptToEvaluateOnNewDocument",
-                  {"source": _JS_ANTI_DETECT})
-    except Exception:
-        pass
-
-    # Empty referrer + transitionType "typed" = address-bar paste in a new tab.
-    print(f"  [导航] 新 tab + Page.navigate (referrer='') → {url[:90]}")
-    _cdp_once(ws_url, "Page.navigate", {
-        "url": url,
-        "referrer": "",
-        "transitionType": "typed",
-    })
+        raise RuntimeError("Failed to create new tab via /json/new?<url>")
 
     time.sleep(1)
     for _ in range(10):
@@ -1071,11 +1064,11 @@ def _navigate_and_wait(port, url):
         except Exception:
             time.sleep(0.5)
     else:
-        raise RuntimeError(f"Tab {tab_id} lost after navigation")
+        raise RuntimeError(f"Tab {tab_id} lost after creation")
 
     _, ws_url = _wait_for_page_ready(port, tab_id)
 
-    # Diagnostic: print actual Referer Chrome sent (should be empty)
+    # Diagnostic: confirm Referer behavior (should be empty for typed nav)
     try:
         actual_ref = _run_js(ws_url, "document.referrer")
         print(f"  [导航] document.referrer = '{actual_ref}'")
