@@ -25,10 +25,10 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from config import SUBMITTED_DIR, BACKUP_DIR
+from config import SUBMITTED_DIR, BACKUP_DIR, INPUT_FILENAME
 
 logger = logging.getLogger("check_stock")
-DEFAULT_XLSX = "Shein Submited Links.xlsx"
+DEFAULT_XLSX = INPUT_FILENAME
 DEBUG_LOG_DIR = Path(__file__).resolve().parent / "debug_logs"
 
 LOW_STOCK_THRESHOLD = 15
@@ -95,7 +95,7 @@ def backup_excel(xlsx_path: Path) -> None:
 def safe_save(wb, xlsx_path: Path) -> None:
     """Save workbook. If locked, save as copy with '2' suffix."""
     try:
-        safe_save(wb, xlsx_path)
+        wb.save(xlsx_path)
     except PermissionError:
         alt = xlsx_path.with_stem(xlsx_path.stem + "2")
         logger.warning("Cannot save to %s (locked), saving to %s", xlsx_path.name, alt.name)
@@ -113,13 +113,19 @@ def _stock_label(total_stock: int | None) -> str:
 
 
 def check_stock_excel(xlsx_path: Path) -> None:
+    # v3.4.1+: navigate via PUT /json/new?<url> (fresh tab per URL, no Referer).
+    # Old single-tab + window.location.href approach was removed.
     from shein_scraper import (
-        _ensure_shein_tab, _run_js, _ws_url_for_id,
-        _JS_DETECT_BLOCK, _JS_POLL, CDP_PORT, _ensure_chrome,
+        _navigate_and_wait, _close_tab, _run_js, _ws_url_for_id,
+        CDP_PORT, _ensure_chrome,
     )
 
     logger.info("Opening: %s", xlsx_path.name)
     wb = load_workbook(xlsx_path)
+
+    # Ensure Chrome is running once for the whole file (not per-sheet)
+    _ensure_chrome(CDP_PORT)
+    today = datetime.now().strftime("%Y-%m-%d")
 
     for ws_name in wb.sheetnames:
         ws = wb[ws_name]
@@ -147,57 +153,50 @@ def check_stock_excel(xlsx_path: Path) -> None:
 
         logger.info("  %d URL(s) to check stock", len(pending))
 
-        # Ensure Chrome is running
-        _ensure_chrome(CDP_PORT)
-        tab_id, ws_url = _ensure_shein_tab(CDP_PORT)
-        today = datetime.now().strftime("%Y-%m-%d")
-
         for idx, (row, seq, url) in enumerate(pending):
             logger.info("  [%d/%d] seq %s: %s", idx + 1, len(pending),
                         seq, url[:60])
 
-            # Navigate via JS
-            try:
-                _run_js(ws_url, f'window.location.href = "{url}";')
-            except Exception:
-                pass
-
-            time.sleep(1)
-
-            # Wait for page + get ws_url
             stock_val = None
-            for _ in range(int(PAGE_WAIT_SEC / 1)):
-                try:
-                    ws_url = _ws_url_for_id(CDP_PORT, tab_id)
+            tab_id = None
+            try:
+                ws_url, tab_id = _navigate_and_wait(CDP_PORT, url)
 
-                    # Check for Oops / delisted
-                    page_check = _run_js(ws_url, """
-                        (function() {
-                            if (document.body && (
-                                document.body.innerText.includes('Oops') ||
-                                document.querySelector('.page-not-found, [class*="not-found"]')
-                            )) return 'OOPS';
-                            if (document.title && document.title.includes('[goods_name]'))
-                                return 'NO_DATA';
-                            return 'OK';
-                        })()
-                    """)
+                # Check for Oops / delisted / NO_DATA placeholder
+                deadline = time.monotonic() + PAGE_WAIT_SEC
+                while time.monotonic() < deadline:
+                    try:
+                        ws_url = _ws_url_for_id(CDP_PORT, tab_id)
+                        page_check = _run_js(ws_url, """
+                            (function() {
+                                if (document.body && (
+                                    document.body.innerText.includes('Oops') ||
+                                    document.querySelector('.page-not-found, [class*="not-found"]')
+                                )) return 'OOPS';
+                                if (document.title && document.title.includes('[goods_name]'))
+                                    return 'NO_DATA';
+                                return 'OK';
+                            })()
+                        """)
+                        if page_check == "OOPS":
+                            stock_val = -1  # delisted
+                            break
+                        if page_check == "NO_DATA":
+                            time.sleep(1)
+                            continue
 
-                    if page_check == "OOPS":
-                        stock_val = -1  # delisted
-                        break
-                    if page_check == "NO_DATA":
-                        time.sleep(1)
-                        continue
-
-                    # Try extract stock
-                    s = _run_js(ws_url, _JS_STOCK)
-                    if s is not None:
-                        stock_val = int(s)
-                        break
-                except Exception:
-                    pass
-                time.sleep(1)
+                        s = _run_js(ws_url, _JS_STOCK)
+                        if s is not None:
+                            stock_val = int(s)
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(1)
+            except Exception as e:
+                logger.warning("    nav error: %s", e)
+            finally:
+                if tab_id is not None:
+                    _close_tab(CDP_PORT, tab_id)
 
             # Write result
             if stock_val == -1:
@@ -246,18 +245,4 @@ def main():
         if default.exists():
             files = [default]
         else:
-            logger.error("Default file not found: %s", default)
-            return
-
-    for f in files:
-        backup_excel(f)
-        try:
-            check_stock_excel(f)
-        except Exception as e:
-            logger.exception("Error: %s", e)
-
-    logger.info("Stock check complete.")
-
-
-if __name__ == "__main__":
-    main()
+            logger.error("Defa

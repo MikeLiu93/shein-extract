@@ -1738,17 +1738,6 @@ def _save_excel(records, path):
 
 _ANTHROPIC_API_KEY: str | None = None
 
-# Set by worker before calling scrape_shein — controls title style per employee/store.
-_TITLE_STYLE: str = ""
-
-_STYLE_INSTRUCTIONS: dict[str, str] = {
-    "NA":    "Style: lead with product features and specifications.",
-    "TT":    "Style: lead with use case and target audience.",
-    "YAN":   "Style: lead with size/dimensions and material.",
-    "ZQW":   "Style: lead with product category and key benefit.",
-    "LUMEI": "Style: lead with color/design and functionality.",
-}
-
 
 def _get_api_key() -> str | None:
     global _ANTHROPIC_API_KEY
@@ -1779,7 +1768,7 @@ Rules:
 7. Remove redundant repeated words (e.g. "Dog Cage Dog Kennel" → "Dog Cage Kennel").
 
 Original: {title}
-{style_instruction}
+
 Reply with ONLY the title, no quotes, no explanation."""
 
 
@@ -1789,7 +1778,6 @@ def _make_ebay_title_ai(original_title: str) -> str | None:
     if not api_key:
         return None
     try:
-        style_inst = _STYLE_INSTRUCTIONS.get(_TITLE_STYLE, "")
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -1803,8 +1791,7 @@ def _make_ebay_title_ai(original_title: str) -> str | None:
                 "temperature": 0.5,
                 "messages": [{"role": "user",
                               "content": _EBAY_TITLE_PROMPT.format(
-                                  title=original_title,
-                                  style_instruction=style_inst)}],
+                                  title=original_title)}],
             },
             timeout=15,
         )
@@ -2703,3 +2690,4 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
         raise RateLimitError(f"Shein 限流：连续 {RATE_LIMIT_CONSECUTIVE} 个 URL 失败")
 
     return records
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   

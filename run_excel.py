@@ -29,10 +29,10 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from shein_scraper import scrape_shein, RateLimitError
-from config import SUBMITTED_DIR, OUTPUT_ROOT_2ND as OUTPUT_ROOT, BACKUP_DIR
+from config import SUBMITTED_DIR, OUTPUT_ROOT_2ND as OUTPUT_ROOT, BACKUP_DIR, INPUT_FILENAME
 
 logger = logging.getLogger("run_excel")
-DEFAULT_XLSX = "Shein Submited Links.xlsx"
+DEFAULT_XLSX = INPUT_FILENAME
 DEBUG_LOG_DIR = Path(__file__).resolve().parent / "debug_logs"
 
 
@@ -227,4 +227,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(

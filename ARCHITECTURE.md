@@ -103,18 +103,21 @@ Google Drive (D:\共享云端硬盘\02 希音\Auto Pipeline\)
 
 ## Core Scraping Flow (shein_scraper.py)
 
-### Anti-Detection Navigation
+### Anti-Detection Navigation (v3.4.1+)
 
 ```
-_ensure_shein_tab()
-  ├─ Reuse SINGLE tab across ALL URLs (no new-tab-per-URL)
-  ├─ If Chrome fresh: visit Shein homepage first (warm up session)
-  └─ Inject JS: hide navigator.webdriver
+_ensure_shein_session()
+  ├─ Once per process: visit Shein homepage to warm cookies
+  └─ No-op if a Shein page already exists in any tab
 
-_navigate_and_wait()
-  ├─ Navigate via JS: window.location.href = url
-  ├─ NOT CDP Page.navigate (detectable)
+_navigate_and_wait(url)
+  ├─ PUT /json/new?<url>  ← single-step: open new tab AT URL
+  ├─ Equivalent to user typing URL in fresh tab's address bar
+  ├─ No Referer (avoids src_identifier vs Referer reconciliation)
   └─ Poll for goods_sn up to 20s
+
+After scrape:
+  └─ _close_tab(tab_id)  ← finally clause closes the tab
 ```
 
 ### Per-URL Processing
@@ -149,26 +152,26 @@ _navigate_and_wait()
 
 ## Interception Handling
 
-### Flow
+### Flow (v3.5+: no auto-solve, no email — local console only)
 
 ```
 URL loaded
     │
     ├─ [goods_name] title? → NO_DATA → skip instantly
-    ├─ Oops/404? → DELISTED → skip (no fail count)
+    ├─ Oops/404? → backoff 30-60s + retry once → DELISTED if still Oops
     │
     ├─ Captcha detected?
-    │     ├─ AI solve (crop+enlarge → Vision API → CDP click) x3
-    │     ├─ Refresh page + AI retry x2
-    │     └─ Email alert + wait 300s for manual solve
+    │     ├─ Take screenshot to screenshots/_captcha_<ts>.png
+    │     ├─ Print warning to console
+    │     └─ Wait up to 300s for human to solve in Chrome window
     │
     └─ Login popup?
           ├─ Auto-dismiss x3
-          └─ Email alert
+          └─ Print warning + screenshot if dismiss fails
 
-After BLOCKED:
+After BLOCKED (captcha unsolved or signin stuck):
     _consecutive_fails += 1
-    ≥ 3 → RATE LIMITED → sleep 2h → next file
+    ≥ 3 → RATE LIMITED → raise RateLimitError → run_excel.py moves on
 ```
 
 ### Captcha Types (GeeTest Icon-Click)
@@ -178,18 +181,19 @@ Three sub-types observed:
 2. **Document types** — read text on icons (FON/PDF/CSV/DOC/TXT)
 3. **People** — match by features (police hat, book, etc.)
 
-AI solver: crop captcha panel → enlarge 2x → Claude Haiku Vision API → CDP click.
-Limited by Haiku vision capability; prevention (anti-detection) is more effective.
+AI auto-solver was removed — Haiku vision wasn't reliable enough on these.
+Current approach: detect captcha → screenshot → print to console → wait
+for the employee to solve it manually in the visible Chrome window.
 
 ---
 
 ## eBay Title Generation
 
 ### AI Path (primary)
-- Claude Haiku API with per-store style variation (anti-association)
-- Styles: NA=specs, TT=use-case, YAN=dimensions, ZQW=category, LUMEI=design
-- `temperature=0.5` for natural variation
-- Post-processing: fix truncated tags, ≤80 chars
+- Claude Haiku API
+- `temperature=0.5` for natural variation between similar products
+- Post-processing: fix truncated `FREE SHIPPING` tag, enforce ≤80 chars
+- (Per-employee style variation was removed in v3.5 — single shared prompt)
 
 ### Fallback Path
 - Strip brand prefix (ALL-CAPS / PascalCase)
@@ -216,14 +220,14 @@ Limited by Haiku vision capability; prevention (anti-detection) is more effectiv
 
 | Measure | Purpose |
 |---------|---------|
-| Single tab reuse | No new-tab-per-URL (bot fingerprint) |
-| JS navigation | `window.location.href` not CDP `Page.navigate` |
-| Session warmup | Visit homepage on fresh Chrome to get cookies |
-| Anti-detect JS | Hide `navigator.webdriver`, fake `chrome.runtime` |
-| Persistent profile | `~/shein-cdp-profile` retains cookies |
-| `--disable-blink-features=AutomationControlled` | Chrome flag |
+| New tab per URL via `PUT /json/new?<url>` | Equivalent to user pasting URL into fresh tab — no Referer, no `Page.navigate` fingerprint |
+| Session warmup | Visit homepage once per process to seed cookies |
+| Persistent profile | `~/shein-cdp-profile` retains cookies / login across runs |
+| `--disable-blink-features=AutomationControlled` | Chrome launch flag |
+| Random 4-12s + long pause every 18 URLs | Human-ish pacing (1000 URLs ≈ 6h) |
 | `[goods_name]` instant skip | Don't waste time on failed pages |
-| Delisted detection | Oops/404 doesn't trigger rate-limit counter |
+| Oops backoff retry | 30-60s sleep + reload before judging DELISTED (avoids false positives from soft bans) |
+| `RATE_LIMIT_CONSECUTIVE = 3` | Bail out after 3 consecutive failures so we don't push through a ban |
 
 ---
 
@@ -238,13 +242,12 @@ All runs are now **manual** via `run_excel.cmd` or command line.
 
 ---
 
-## Email Alerts (notify.py)
+## Alerts (notify.py — v3.5+: local console only)
 
-| Function | Trigger |
-|----------|---------|
-| `alert_captcha()` | Captcha AI+refresh all failed |
-| `alert_signin()` | Login popup can't auto-dismiss |
-| `alert_generic()` | Page timeout, extraction failure |
+Email was removed when the project was packaged for employees. The same
+function names (`alert_captcha`, `alert_signin`, `alert_generic`) now just
+print a banner to stdout and reference the screenshot file. Function
+signatures unchanged so the scraper code didn't need to change.
 
 ---
 
@@ -253,12 +256,4 @@ All runs are now **manual** via `run_excel.cmd` or command line.
 Major architectural shift from TXT-based to Excel-based pipeline:
 
 1. **New Excel pipeline** (`run_excel.py`) — worksheet per store, explicit Seq numbers, Date/Status writeback
-2. **Stock checker** (`check_stock.py`) — lightweight inventory monitoring
-3. **Removed scheduled task** — manual runs only (screen-off → captcha → rate limit)
-4. **Navigation rewrite** — single tab reuse + JS navigation (was: new tab per URL + CDP navigate)
-5. **Anti-detection** — referrer, session warmup, webdriver hiding
-6. **[goods_name] instant skip** — no more 60s wait on dead pages
-7. **Delisted detection** — Oops/404 doesn't trigger rate-limit
-8. **_retry.txt disabled** — failures tracked in input Excel instead
-9. **Output naming** — `{store}-{min}-{max}-{date}.xlsx`
-10. **Seq always recorded** — even for Failed rows in output Excel
+2. **Stock checker*
