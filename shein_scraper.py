@@ -1762,10 +1762,16 @@ Rules:
 1. REMOVE brand names (usually the first 1-2 words, e.g. "UMAY", "EastVita", "Pempet", "NIKE PRO", "SheGlam"). Common nouns like "Dog", "Kids" are NOT brands.
 2. KEEP all measurements/units with punctuation: 29"-45", 0.25LB, 24"/30"/36", 2", 100ml, 3.5oz.
 3. KEEP structural punctuation: inch marks ", ranges -, slashes /, parentheses ().
-4. Use the FULL 80 characters as much as possible — prioritize keeping more keywords.
-5. ALWAYS start with "NEW " and end with " FREE SHIPPING" if the total is ≤ 80 chars. If too long, try just "NEW " prefix. Drop tags only as a last resort.
-6. Do NOT invent information. Only use words from the original title.
-7. Remove redundant repeated words (e.g. "Dog Cage Dog Kennel" → "Dog Cage Kennel").
+4. Use the FULL 80 characters as much as possible — prioritize packing in keywords buyers search for.
+5. PRIORITIZE high-traffic eBay search keywords. When the original title supports them, surface words from these categories:
+   - Audience: For Men / For Women / For Kids / For Pets / For Cats / For Dogs / Unisex
+   - Use case: Outdoor / Indoor / Travel / Home / Office / Gift / Wedding / Christmas / Birthday / Party / Camping
+   - Quality cues: Heavy Duty / Premium / Adjustable / Foldable / Waterproof / Washable / Portable / Durable / Reusable
+   - Style cues: Modern / Vintage / Cute / Luxury / Minimalist / Cozy
+   NEVER invent attributes that the original title does not support.
+6. You MAY add "NEW" as a prefix or "FREE SHIPPING" as a suffix ONLY if there is genuine spare space after you've packed in the keywords above. Do NOT add them just to fill space — they are low-value high-competition phrases on eBay that crowd out better keywords.
+7. Do NOT invent information. Only use words/concepts present in the original title.
+8. Remove redundant repeated words (e.g. "Dog Cage Dog Kennel" → "Dog Cage Kennel").
 
 Original: {title}
 
@@ -2687,7 +2693,4 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
     #         retry_path.unlink(missing_ok=True)
 
     if _rate_limited:
-        raise RateLimitError(f"Shein 限流：连续 {RATE_LIMIT_CONSECUTIVE} 个 URL 失败")
-
-    return records
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   
+        raise RateLimitError
