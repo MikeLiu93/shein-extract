@@ -2693,4 +2693,17 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
     # if failed:
     #     lines = []
     #     for r in failed:
-    #         seq = r.get("s
+    #         seq = r.get("seq_num", "?")
+    #         status = r.get("status", "UNKNOWN")
+    #         url = r.get("url", "")
+    #         lines.append(f"{seq}\t{status}\t{url}")
+    #     retry_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    #     print(f"  [Retry] {len(failed)} 个失败 URL 已写入 {retry_path.name}")
+    # else:
+    #     if retry_path.exists():
+    #         retry_path.unlink(missing_ok=True)
+
+    if _rate_limited:
+        raise RateLimitError(f"Shein 限流：连续 {RATE_LIMIT_CONSECUTIVE} 个 URL 失败")
+
+    return records

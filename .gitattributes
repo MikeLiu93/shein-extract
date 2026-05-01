@@ -1,0 +1,4 @@
+# Windows batch files must use CRLF — CMD.exe mis-parses LF-only .bat/.cmd
+# (treats line continuations wrong, eats first chars of each line).
+*.bat text eol=crlf
+*.cmd text eol=crlf

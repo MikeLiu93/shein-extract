@@ -245,4 +245,18 @@ def main():
         if default.exists():
             files = [default]
         else:
-            logger.error("Defa
+            logger.error("Default file not found: %s", default)
+            return
+
+    for f in files:
+        backup_excel(f)
+        try:
+            check_stock_excel(f)
+        except Exception as e:
+            logger.exception("Error: %s", e)
+
+    logger.info("Stock check complete.")
+
+
+if __name__ == "__main__":
+    main()

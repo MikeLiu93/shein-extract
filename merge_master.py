@@ -372,3 +372,37 @@ def main():
     if not store_code:
         print()
         logger.error("[错误] 未输入店铺代号，退出。")
+        sys.exit(1)
+
+    store_code = store_code.upper()
+    store_dir = OUTPUT_ROOT_2ND / store_code
+    if not store_dir.is_dir():
+        print()
+        logger.error("[错误] 店铺文件夹不存在: %s", store_dir)
+        logger.error("可用的店铺目录如下：")
+        if OUTPUT_ROOT_2ND.is_dir():
+            stores = [sub.name for sub in sorted(OUTPUT_ROOT_2ND.iterdir())
+                      if sub.is_dir()]
+            if stores:
+                for s in stores:
+                    logger.error("  - %s", s)
+            else:
+                logger.error("  (无)")
+        else:
+            logger.error("(输出根目录本身不存在: %s)", OUTPUT_ROOT_2ND)
+        sys.exit(1)
+
+    print()
+    logger.info("正在合并店铺 '%s'，目录: %s", store_code, store_dir)
+    print()
+    ok = merge_store(store_code, store_dir, dry_run=args.dry_run)
+    print()
+    if ok:
+        logger.info("✓ 合并完成。总表已写入 %s_master.xlsx", store_code)
+    else:
+        logger.error("✗ 合并未成功，请查看上面的日志。")
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

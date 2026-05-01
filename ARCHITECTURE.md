@@ -256,4 +256,12 @@ signatures unchanged so the scraper code didn't need to change.
 Major architectural shift from TXT-based to Excel-based pipeline:
 
 1. **New Excel pipeline** (`run_excel.py`) — worksheet per store, explicit Seq numbers, Date/Status writeback
-2. **Stock checker*
+2. **Stock checker** (`check_stock.py`) — lightweight inventory monitoring
+3. **Removed scheduled task** — manual runs only (screen-off → captcha → rate limit)
+4. **Navigation rewrite** — single tab reuse + JS navigation (was: new tab per URL + CDP navigate)
+5. **Anti-detection** — referrer, session warmup, webdriver hiding
+6. **[goods_name] instant skip** — no more 60s wait on dead pages
+7. **Delisted detection** — Oops/404 doesn't trigger rate-limit
+8. **_retry.txt disabled** — failures tracked in input Excel instead
+9. **Output naming** — `{store}-{min}-{max}-{date}.xlsx`
+10. **Seq always recorded** — even for Failed rows in output Excel
