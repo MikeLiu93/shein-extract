@@ -35,3 +35,20 @@ _test_run/
 _smoke.py
 _inspect_*.py
 exam pics/
+
+# Build artifacts (PyInstaller / Inno Setup)
+build/
+dist/
+*.spec.bak
+*.pyz
+
+# Owner-only build secrets
+.build_key.txt
+key_store.py
+
+# Sandbox / migration temp files
+.git/_trash/
+.git/*.dead.*
+.git/**/*.dead.*
+COMMIT_MSG_*.txt
+test_can_create.txt

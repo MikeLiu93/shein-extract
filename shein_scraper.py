@@ -1743,14 +1743,25 @@ def _get_api_key() -> str | None:
     global _ANTHROPIC_API_KEY
     if _ANTHROPIC_API_KEY is not None:
         return _ANTHROPIC_API_KEY or None
-    # Try .env in project dir
+    # 1) Bundled obfuscated key (PyInstaller deployment to employees).
+    #    key_store.py is generated at build time by make_key_store.py and
+    #    is gitignored. Won't exist in source checkout — that's fine.
+    try:
+        from key_store import get_obfuscated_key
+        k = get_obfuscated_key()
+        if k:
+            _ANTHROPIC_API_KEY = k
+            return _ANTHROPIC_API_KEY
+    except ImportError:
+        pass
+    # 2) .env in project dir (developer / source checkout).
     env_path = Path(__file__).resolve().parent / ".env"
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
             if line.startswith("ANTHROPIC_API_KEY="):
                 _ANTHROPIC_API_KEY = line.split("=", 1)[1].strip()
                 return _ANTHROPIC_API_KEY
-    # Fallback to environment variable
+    # 3) Process environment variable.
     _ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
     return _ANTHROPIC_API_KEY or None
 
@@ -2682,15 +2693,4 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
     # if failed:
     #     lines = []
     #     for r in failed:
-    #         seq = r.get("seq_num", "?")
-    #         status = r.get("status", "UNKNOWN")
-    #         url = r.get("url", "")
-    #         lines.append(f"{seq}\t{status}\t{url}")
-    #     retry_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    #     print(f"  [Retry] {len(failed)} 个失败 URL 已写入 {retry_path.name}")
-    # else:
-    #     if retry_path.exists():
-    #         retry_path.unlink(missing_ok=True)
-
-    if _rate_limited:
-        raise RateLimitError
+    #         seq = r.get("s
