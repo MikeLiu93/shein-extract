@@ -30,6 +30,16 @@ from copy import copy
 from datetime import datetime
 from pathlib import Path
 
+# Force UTF-8 stdout/stdin/stderr on Windows when launched from a .cmd
+# whose codepage was just switched to 65001 (chcp 65001). Python sometimes
+# guesses cp936 from the registry — this ensures Chinese prints/inputs work.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass
+
 from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
@@ -348,6 +358,11 @@ def main():
 
     setup_logging()
 
+    print("============================================")
+    print("  Shein 总表合并工具 (merge_master)")
+    print("============================================")
+    print()
+
     store_code = (args.store or "").strip()
     if not store_code:
         try:
@@ -355,24 +370,5 @@ def main():
         except EOFError:
             store_code = ""
     if not store_code:
-        logger.error("No store code given — aborting.")
-        sys.exit(1)
-
-    store_code = store_code.upper()
-    store_dir = OUTPUT_ROOT_2ND / store_code
-    if not store_dir.is_dir():
-        logger.error("Store folder does not exist: %s", store_dir)
-        logger.error("Available stores under %s:", OUTPUT_ROOT_2ND)
-        if OUTPUT_ROOT_2ND.is_dir():
-            for sub in sorted(OUTPUT_ROOT_2ND.iterdir()):
-                if sub.is_dir():
-                    logger.error("  - %s", sub.name)
-        sys.exit(1)
-
-    logger.info("Merging store '%s' from %s", store_code, store_dir)
-    ok = merge_store(store_code, store_dir, dry_run=args.dry_run)
-    sys.exit(0 if ok else 1)
-
-
-if __name__ == "__main__":
-    main()
+        print()
+        logger.error("[错误] 未输入店铺代号，退出。")
