@@ -22,6 +22,15 @@ setlocal enabledelayedexpansion
 chcp 65001 >nul
 cd /d "%~dp0"
 
+REM Anaconda ships tk/tcl/openssl/lxml DLLs in Library\bin. PyInstaller
+REM walks dependencies via PATH — without this, DLLs aren't found and
+REM the resulting EXE crashes at runtime (e.g. ImportError: _tkinter).
+for /f "delims=" %%P in ('python -c "import sys,os; print(os.path.join(sys.prefix,'Library','bin'))" 2^>nul') do set "CONDA_LIBBIN=%%P"
+if defined CONDA_LIBBIN if exist "%CONDA_LIBBIN%" (
+    echo [build] Prepending conda Library\bin to PATH: %CONDA_LIBBIN%
+    set "PATH=%CONDA_LIBBIN%;%PATH%"
+)
+
 echo ============================================================
 echo  Step 1/3: Generate key_store.py from .build_key.txt
 echo ============================================================
