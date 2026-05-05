@@ -1,5 +1,13 @@
 # Shein Product Scraper - CHANGELOG
 
+## v3.6.0 — 2026-05-06
+- **密码门 + 中央撤销 (`auth.py` + `auth.json`)**: 启动时强制要求密码。哈希列表放在 GitHub raw URL（`/main/auth.json`），员工电脑拉取并和本地输入的 SHA-256 比对。撤销访问 = 编辑 auth.json 删除/置 `active:false` 那一行 + push commit，~5min CDN 缓存生效后 24h 内全员验证失败。
+- **本地 24h 缓存 + 离线降级**: 验证成功后写 `%APPDATA%\shein-extract\auth_cache.json`，24h 内静默放行。如果 GitHub 暂时连不上但本地缓存还在 24h 内，警告但允许跑（员工偶发断网不阻塞工作）。缓存过期且离线则拒绝。
+- **forward-compatible schema**: auth.json 用 list-of-dicts，每条带 `label`/`active` 字段。当前只有一条 `"shared"`，将来加按团队密码只需 append 一行；某团队走人就改/删那一条，其他团队完全不受影响。
+- **`SheinExtract.exe --config` 重开设置向导**: 安装时一次性输入的路径/Excel 文件名/Anthropic key 现在可以随时重新编辑。`setup_wizard.Wizard.__init__` 加 `_load_existing_config()`，启动时读 `config.env` 预填所有 entry——员工再次打开看到的就是上次的值，改哪改哪。
+- **桌面/开始菜单 "配置 SHEIN 上架工具" 快捷方式**: `installer.iss` 加两条 `[Icons]` 调 `--config`。员工双击即可改设置，不用记命令行。
+- **owner-side 工具 `make_password_hash.py`**: 输入密码两次，输出 64 位 SHA-256，复制到 auth.json 即可。
+
 ## v3.4.1 — 2026-04-29
 - **修复 v3.4 的 Page.navigate 不生效**: `Page.navigate(url, referrer="")` 被 Chrome 解析为"空字符串作为 Referer URL"，整个 navigate 命令被吞掉，新 tab 卡在 `chrome://newtab/` 不动。
 - **改用 `PUT /json/new?<url>`**: CDP 原生支持，单步完成"开新 tab + 加载 URL"，等同于用户地址栏粘贴。`_new_tab(port, url=None)` 加 url 参数，URL 用 `urllib.parse.quote` 转义。

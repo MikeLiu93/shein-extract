@@ -117,6 +117,10 @@ class Wizard:
         self.chrome_path = None
         self.detected_drive = None
 
+        # If config.env already exists (re-run via --config), pre-fill the
+        # entries with the saved values so the user edits in place.
+        self._load_existing_config()
+
         # Container with consistent padding
         self.frame = ttk.Frame(self.root, padding=20)
         self.frame.pack(fill="both", expand=True)
@@ -131,6 +135,29 @@ class Wizard:
         ]
         self.step_idx = 0
         self._render()
+
+    def _load_existing_config(self) -> None:
+        if not CONFIG_FILE.exists():
+            return
+        try:
+            text = CONFIG_FILE.read_text(encoding="utf-8")
+        except Exception:
+            return
+        env_to_state = {
+            "SHEIN_SUBMITTED_DIR":  "submitted_dir",
+            "SHEIN_INPUT_FILENAME": "input_filename",
+            "SHEIN_OUTPUT_DIR":     "output_dir",
+            "SHEIN_BACKUP_DIR":     "backup_dir",
+        }
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if k in env_to_state:
+                self.values[env_to_state[k]] = v
 
     # ── frame mgmt ──
     def _clear(self):

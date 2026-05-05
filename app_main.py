@@ -42,6 +42,23 @@ def main():
         print(f"SHEIN 上架工具  v{VERSION}")
         print("=" * 60)
 
+        # 0. Password gate — applies to BOTH normal launch and --config mode
+        #    so unauthorized users can't even reconfigure settings.
+        from auth import gate
+        if not gate():
+            return 2
+
+        # --config: re-run the setup wizard and exit (don't proceed to scrape)
+        if "--config" in sys.argv:
+            from setup_wizard import run_wizard
+            print("[配置] 打开设置向导...")
+            ok = run_wizard()
+            if ok:
+                print("[配置] 已保存。")
+                return 0
+            print("[配置] 已取消（未保存）。")
+            return 1
+
         # 1. First-run wizard
         from setup_wizard import is_first_run_complete, run_wizard
         if not is_first_run_complete():
