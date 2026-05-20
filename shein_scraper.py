@@ -2380,16 +2380,19 @@ def _download_media(rec: dict, base_dir: "Path", seq_num: "int | None" = None) -
 
 # ── Public function ───────────────────────────────────────────────────────────
 
-def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None):
+def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
+                 price_list=None):
     """
     抓取一个或多个 Shein 商品 URL，保存到 Excel。
 
     Parameters
     ----------
-    urls      : str | list[str]
-    output    : str               输出 .xlsx 文件名
-    start_seq : int               Excel 第一列序号起始值
-    seq_list  : list[int] | None  每个 URL 对应的序号（用于 retry，覆盖 start_seq）
+    urls       : str | list[str]
+    output     : str               输出 .xlsx 文件名
+    start_seq  : int               Excel 第一列序号起始值
+    seq_list   : list[int] | None  每个 URL 对应的序号（用于 retry，覆盖 start_seq）
+    price_list : list[float|None] | None  每个 URL 对应的手动售价（USD）；非 None
+                 则覆盖网页爬取的 sale_price，并据此重算 shipping/eBay price
     """
     if isinstance(urls, str):
         urls = [urls]
@@ -2544,6 +2547,20 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
 
                 if not isinstance(data, dict):
                     raise ValueError("JS returned unexpected type — page may not have loaded")
+
+                # 手动售价覆盖：C 列价格替代网页爬到的 sale_price（用户填写更可靠）
+                # 同时把每个 sku_prices 变体的 sale_price 也改成 C 列价格，
+                # 这样下游"各变体价格"、变体子行、Variation 2 显示等都用同一价格。
+                override_price = (price_list[i - 1] if price_list else None)
+                if override_price is not None:
+                    web_price = data.get("price")
+                    op = float(override_price)
+                    data["price"] = op
+                    for _sp in (data.get("sku_prices") or []):
+                        _sp["sale_price"] = op
+                    print(f"  [price override] C列=${op:.2f} "
+                          f"(网页=${(web_price or 0):.2f}, "
+                          f"sku_prices×{len(data.get('sku_prices') or [])} 同步)")
 
                 shipping = _calc_shipping(data)
                 price    = data.get("price") or 0.0

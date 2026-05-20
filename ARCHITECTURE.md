@@ -62,15 +62,20 @@ Each **worksheet = one store** (e.g. `B4`, `L8`, `Test1`)
 |-----|--------|------------|-------------|
 | A | Seq | **Read only** | Sequence number = output folder name |
 | B | Website | **Read only** | Shein product URL |
-| C | Date | **Write** | Execution date (YYYY-MM-DD) |
-| D | Status | **Write** | Done / Failed / Delisted |
-| E | Stock | **Write** | In Stock (N) / Low Stock (N) / Sold Out / Delisted |
-| F | Last Checked | **Write** | Stock check date (YYYY-MM-DD) |
+| C | Price | **Read only** | Manual product price (USD) — overrides web sale_price |
+| D | Date | **Write** | Execution date (YYYY-MM-DD) |
+| E | Status | **Write** | Done / Failed / Delisted |
+| F | Stock | **Write** | In Stock (N) / Low Stock (N) / Sold Out / Delisted |
+| G | Last Checked | **Write** | Stock check date (YYYY-MM-DD) |
 
 **Rules:**
 - `run_excel.py` processes rows where **Date AND Status are both empty**
 - `check_stock.py` processes rows where **Status == "Done"**
-- Columns A and B are **never modified** by any script
+- Columns A, B, C are **never modified** by any script
+- Column C (Price), if filled, replaces the web-scraped sale price for that row. The
+  eBay listing price formula stays `max(price + shipping, $22) × 1.4`, but `price`
+  comes from column C instead of the web. If column C is empty, the scraper falls
+  back to the web sale price.
 
 ---
 

@@ -7,10 +7,10 @@ Usage:
     python check_stock.py                          # scan submitted/ for .xlsx
     python check_stock.py "path/to/file.xlsx"      # specific file
 
-Only processes rows where Status == "Done".
+Only processes rows where Status (col E) == "Done".
 Writes:
-    Column 5 (Stock): "In Stock (123)" / "Low Stock (5)" / "Sold Out" / "Delisted"
-    Column 6 (Last Checked): YYYY-MM-DD
+    Column 6 (Stock): "In Stock (123)" / "Low Stock (5)" / "Sold Out" / "Delisted"
+    Column 7 (Last Checked): YYYY-MM-DD
 """
 
 import argparse
@@ -132,16 +132,16 @@ def check_stock_excel(xlsx_path: Path) -> None:
         store = ws_name.strip()
         logger.info("Sheet: %s", store)
 
-        # Ensure headers in columns 5 and 6
-        if ws.cell(1, 5).value != "Stock":
-            ws.cell(1, 5).value = "Stock"
-        if ws.cell(1, 6).value != "Last Checked":
-            ws.cell(1, 6).value = "Last Checked"
+        # Ensure headers in columns 6 (Stock) and 7 (Last Checked)
+        if ws.cell(1, 6).value != "Stock":
+            ws.cell(1, 6).value = "Stock"
+        if ws.cell(1, 7).value != "Last Checked":
+            ws.cell(1, 7).value = "Last Checked"
 
-        # Collect rows: Status == "Done", needs stock check
+        # Collect rows: Status (col E) == "Done", needs stock check
         pending = []
         for row in range(2, ws.max_row + 1):
-            status = str(ws.cell(row, 4).value or "").strip()
+            status = str(ws.cell(row, 5).value or "").strip()
             url = ws.cell(row, 2).value
             seq = ws.cell(row, 1).value
             if status == "Done" and url:
@@ -206,8 +206,8 @@ def check_stock_excel(xlsx_path: Path) -> None:
             else:
                 label = "Unknown"
 
-            ws.cell(row, 5).value = label
-            ws.cell(row, 6).value = today
+            ws.cell(row, 6).value = label
+            ws.cell(row, 7).value = today
             logger.info("    → %s", label)
 
             # Save every 10 rows
