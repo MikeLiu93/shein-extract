@@ -4,7 +4,7 @@
 
 #define MyAppName "SHEIN 上架工具"
 #define MyAppNameAscii "SheinExtract"
-#define MyAppVersion "3.6.0"          ; Keep in sync with version.py
+#define MyAppVersion "3.7.0"          ; Keep in sync with version.py
 #define MyAppPublisher "MikeLiu93"
 #define MyAppURL "https://github.com/MikeLiu93/shein-extract"
 #define MyAppExeName "SheinExtract.exe"

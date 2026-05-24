@@ -1,5 +1,11 @@
 # Shein Product Scraper - CHANGELOG
 
+## v3.7.0 — 2026-05-20
+- **Excel C 列新增 "Price"，手动售价覆盖网页爬到的 sale_price**: 输入 Excel 列右移一位 (A=Seq, B=Website, C=Price 新, D=Date, E=Status, F=Stock, G=Last Checked)。C 列填了价就以 C 为准，否则回退到网页价。
+- **价格一致性**: 不只主商品 price，每个 sku_prices 变体的 sale_price 也同步覆盖，"各变体价格"段、变体子行、Variation 2 单元格全部使用 C 列价格，避免"主行 eBay $37.11 / 变体 eBay $30.80"这种 confusing 输出。
+- **eBay 价公式不变**: `max(C列价格 + shipping, $22) × 1.4`，只是 price 来源换成 C 列。
+- **`run_excel.py` / `check_stock.py` 列号偏移**: Date→D, Status→E, Stock→F, Last Checked→G。Header 自动补齐 ("Price" / "Date")。
+
 ## v3.6.0 — 2026-05-06
 - **密码门 + 中央撤销 (`auth.py` + `auth.json`)**: 启动时强制要求密码。哈希列表放在 GitHub raw URL（`/main/auth.json`），员工电脑拉取并和本地输入的 SHA-256 比对。撤销访问 = 编辑 auth.json 删除/置 `active:false` 那一行 + push commit，~5min CDN 缓存生效后 24h 内全员验证失败。
 - **本地 24h 缓存 + 离线降级**: 验证成功后写 `%APPDATA%\shein-extract\auth_cache.json`，24h 内静默放行。如果 GitHub 暂时连不上但本地缓存还在 24h 内，警告但允许跑（员工偶发断网不阻塞工作）。缓存过期且离线则拒绝。
