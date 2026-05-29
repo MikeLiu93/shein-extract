@@ -1229,6 +1229,37 @@ def _ebay_listing_price(price: float, shipping: float) -> float:
     return round(max(base, EBAY_MIN_SUBTOTAL) * EBAY_MARKUP, 2)
 
 
+def _merge_main_sale_attr_colors(variations: dict, main_sale_attrs: list) -> dict:
+    """mainSaleAttribute 是颜色变体的权威清单（每个颜色 = 独立 goods_sn）。
+
+    DOM 抓取在 URL 预选了某颜色时（?main_attr=...）只会拿到选中的那一个，
+    导致其它颜色丢失。用 main_sale_attrs 的完整颜色列表覆盖 variations 中
+    对应属性（按 attr_name 大小写不敏感匹配，保留原 key 的写法）。
+    """
+    if not main_sale_attrs:
+        return variations
+    variations = dict(variations or {})
+    attr_name = ""
+    vals, seen = [], set()
+    for msa in main_sale_attrs:
+        nm = (msa.get("attr_name") or "").strip()
+        vv = (msa.get("attr_value_name") or "").strip()
+        if nm and not attr_name:
+            attr_name = nm
+        if not vv:
+            continue
+        k = vv.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        vals.append(vv)
+    if not attr_name or not vals:
+        return variations
+    existing = next((k for k in variations if k.lower() == attr_name.lower()), None)
+    variations[existing or attr_name] = vals
+    return variations
+
+
 def _split_variations_for_excel(variations: dict, sku_prices: list = None,
                                 shipping: float = 0.0) -> tuple[str, str]:
     """
@@ -1900,13 +1931,15 @@ def _make_ebay_title(original_title: str, variations: dict, max_len: int = 80) -
     t = re.sub(r'^\s*[,;]\s*', '', t)      # leading separator
     t = _clean_ws(t)
 
-    # 2) Extract color from variations
+    # 2) Extract color from variations — only when there's a SINGLE color.
+    # 多色商品（带颜色变体）标题不拼具体颜色，颜色全在 Variation 列里展示，
+    # 也避免与下载的（选中色）图片对不上。与下方内联 color 追加逻辑一致。
     color = ""
     if isinstance(variations, dict):
         for k in variations.keys():
             if "color" in (k or "").lower():
                 vals = variations.get(k) or []
-                if isinstance(vals, list) and vals:
+                if isinstance(vals, list) and len(vals) == 1:
                     color = _clean_ws(str(vals[0]))
                 break
 
@@ -2547,6 +2580,11 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
 
                 if not isinstance(data, dict):
                     raise ValueError("JS returned unexpected type — page may not have loaded")
+
+                # 颜色变体修正：DOM 在预选颜色(?main_attr=...)时只拿到选中的一个，
+                # 用 mainSaleAttribute 的完整颜色清单补全 variations
+                data["variations"] = _merge_main_sale_attr_colors(
+                    data.get("variations") or {}, data.get("main_sale_attrs") or [])
 
                 # 手动售价覆盖：C 列价格替代网页爬到的 sale_price（用户填写更可靠）
                 # 同时把每个 sku_prices 变体的 sale_price 也改成 C 列价格，
