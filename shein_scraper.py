@@ -111,6 +111,32 @@ class RateLimitError(Exception):
     pass
 
 
+_rate_limit_lock  = threading.Lock()
+_rate_limit_state = {"consecutive_fails": 0, "tripped": False}
+
+
+def _record_result_for_rate_limit(rec_status: str) -> bool:
+    """更新共享的限流计数器。返回 True 表示已触发限流
+    （调用方应放弃剩余 URL）。一旦触发就一直返回 True，直到 reset。"""
+    with _rate_limit_lock:
+        if _rate_limit_state["tripped"]:
+            return True
+        if rec_status != "OK":
+            _rate_limit_state["consecutive_fails"] += 1
+            if _rate_limit_state["consecutive_fails"] >= RATE_LIMIT_CONSECUTIVE:
+                _rate_limit_state["tripped"] = True
+                return True
+        else:
+            _rate_limit_state["consecutive_fails"] = 0
+        return False
+
+
+def _reset_rate_limit_state() -> None:
+    with _rate_limit_lock:
+        _rate_limit_state["consecutive_fails"] = 0
+        _rate_limit_state["tripped"] = False
+
+
 # ── JavaScript: 轮询用（只检查 goods_sn 是否出现）────────────────────────────
 _JS_POLL = r"""
 (function(){
@@ -2595,8 +2621,254 @@ def _download_media(rec: dict, base_dir: "Path", seq_num: "int | None" = None) -
 
 # ── Public function ───────────────────────────────────────────────────────────
 
+def _scrape_one_url(
+    url: str, index: int, total: int, seq_num: int,
+    override_price, override_shipping, variant_filter_decl: str,
+) -> dict:
+    """在自己的 CDP tab 里抓一个商品 URL，返回 record dict。
+
+    线程安全：每次调用开自己的 tab、用自己的 WebSocket。绝不向外抛异常
+    （异常包成 rec["status"]）。返回前无条件睡 2–3 秒（含自己手上的最后一条）。
+    """
+    print(f"[{index}/{total}] {url[:80]}...")
+    rec = {"url": url, "status": "OK", "seq_num": seq_num}
+    tab_id = None
+    _url_start_time = time.monotonic()
+    try:
+        print("  navigating...")
+        ws_url, tab_id = _navigate_and_wait(CDP_PORT, url)
+
+        # 检测登录/验证码拦截
+        base_dir = Path.cwd()
+        if not _check_and_handle_block(CDP_PORT, tab_id, url, base_dir):
+            rec["status"] = "BLOCKED"
+            print("  [跳过] 页面被拦截，无法提取")
+            return rec
+        # 重置提取超时计时器：拦截处理（尤其验证码）可能耗时数分钟
+        _url_start_time = time.monotonic()
+
+        # 检测商品下架/404（Oops 页面）或数据未加载（[goods_name]）
+        _OOPS_DETECT_JS = """
+            (function() {
+                if (document.body && (
+                    document.body.innerText.includes('Oops') ||
+                    document.querySelector('.page-not-found, .error-page, [class*="not-found"]')
+                )) return 'OOPS';
+                if (document.title && document.title.includes('[goods_name]'))
+                    return 'NO_DATA';
+                return 'OK';
+            })()
+        """
+        try:
+            _page_check = _run_js(ws_url, _OOPS_DETECT_JS)
+
+            # OOPS 可能是真下架，也可能是 bot 软封禁。先退避重试一次再判定。
+            if _page_check == "OOPS":
+                _backoff = random.uniform(OOPS_RETRY_BACKOFF_MIN, OOPS_RETRY_BACKOFF_MAX)
+                print(f"  [OOPS] 商品页显示 Oops — 退避 {_backoff:.0f}s 后重试...")
+                time.sleep(_backoff)
+                try:
+                    ws_url = _reload_tab_and_wait(CDP_PORT, tab_id)
+                    _page_check = _run_js(ws_url, _OOPS_DETECT_JS)
+                except Exception:
+                    pass
+                if _page_check == "OOPS":
+                    rec["status"] = "DELISTED"
+                    print("  [跳过] 重试后仍 Oops，判定真下架")
+                    return rec
+                print(f"  [OOPS] 重试成功 (state={_page_check})，继续提取")
+                # 重置计时器（退避耗时不计入提取超时）
+                _url_start_time = time.monotonic()
+
+            if _page_check == "NO_DATA":
+                rec["status"] = "NO_DATA"
+                print("  [跳过] 页面数据未加载 ([goods_name])")
+                return rec
+        except Exception:
+            pass
+
+        # 滚动触发懒加载，稍等片刻
+        try:
+            _run_js(ws_url, _JS_SCROLL_GALLERY)
+            time.sleep(1.0)
+            ws_url = _ws_url_for_id(CDP_PORT, tab_id)
+        except Exception:
+            pass
+
+        data = None
+        for attempt in range(PAGE_LOAD_RETRIES):
+            # 超时保护：如果单个页面总耗时超过 EXTRACTION_TIMEOUT_SEC
+            _elapsed = time.monotonic() - _url_start_time
+            if _elapsed > EXTRACTION_TIMEOUT_SEC:
+                print(f"  [超时] 页面处理已超过 {EXTRACTION_TIMEOUT_SEC}s，可能被隐形拦截")
+                # 二次验证码检测
+                _recheck = None
+                try:
+                    ws_url = _ws_url_for_id(CDP_PORT, tab_id)
+                    _recheck = _run_js(ws_url, _JS_DETECT_BLOCK)
+                except Exception:
+                    pass
+                # 无论是否检测到验证码，都截图通知
+                ss_path = str(_screenshots_dir(base_dir) / f"_timeout_{time.strftime('%Y%m%d_%H%M%S')}.png")
+                try:
+                    ws_url = _ws_url_for_id(CDP_PORT, tab_id)
+                    _take_screenshot(ws_url, ss_path)
+                except Exception:
+                    ss_path = None
+                _block_info = ""
+                if isinstance(_recheck, dict) and _recheck.get("blocked"):
+                    _block_info = f"\n检测到拦截类型: {_recheck.get('type', 'unknown')}"
+                alert_generic(
+                    url,
+                    f"页面处理超时（{_elapsed:.0f}s > {EXTRACTION_TIMEOUT_SEC}s），"
+                    f"可能存在隐形验证码或页面加载异常。{_block_info}",
+                    screenshot_path=ss_path,
+                )
+                rec["status"] = "TIMEOUT"
+                data = None
+                break
+
+            print("  extracting...")
+            data = _run_js(ws_url, _JS)
+            if isinstance(data, dict) and not _shein_page_needs_retry(data):
+                break
+            if attempt < PAGE_LOAD_RETRIES - 1:
+                print(
+                    f"  transient/error page (try {attempt + 1}/{PAGE_LOAD_RETRIES}), "
+                    "reloading..."
+                )
+                time.sleep(RELOAD_PAUSE_SEC)
+                ws_url = _reload_tab_and_wait(CDP_PORT, tab_id)
+
+        if rec.get("status") == "TIMEOUT":
+            print("  [跳过] 页面超时")
+            return rec  # tab closed by finally
+
+        if not isinstance(data, dict):
+            raise ValueError("JS returned unexpected type — page may not have loaded")
+
+        # 颜色变体修正：DOM 在预选颜色(?main_attr=...)时只拿到选中的一个，
+        # 用 mainSaleAttribute 的完整颜色清单补全 variations
+        data["variations"] = _merge_main_sale_attr_colors(
+            data.get("variations") or {}, data.get("main_sale_attrs") or [])
+
+        # 模板 C（原价）/ D（运费）/ E（变体）三列的覆盖
+        derived = _apply_row_overrides(
+            data, override_price, override_shipping, variant_filter_decl)
+        if derived["unknown_variants"]:
+            print(f"  [变体] 声明里这些值在页面上找不到: "
+                  f"{', '.join(derived['unknown_variants'])}")
+        if derived["variant_filter_no_match"]:
+            rec["status"] = "variant_filter_no_match"
+            print("  [跳过] E列声明的变体一个都没匹配上")
+            return rec
+
+        price      = derived["price"]
+        shipping   = derived["shipping"]
+        ebay       = derived["ebay_price"]
+        sku_prices = data.get("sku_prices") or []
+
+        rec.update({
+            "sku":            data.get("goods_sn") or data.get("goods_id", ""),
+            "price":          price,
+            "shipping":       shipping,
+            "website":        "us.shein.com",
+            "store_name":     data.get("store_name", ""),
+            "original_title": data.get("title", ""),
+            "title":          data.get("title", ""),
+            "variations":     data.get("variations", {}),
+            "ebay_price":     ebay,
+            "media":          data.get("media", {}),
+            "goods_imgs":     data.get("goods_imgs") or [],
+            "sku_prices":     sku_prices,
+            "main_sale_attrs": data.get("main_sale_attrs") or [],
+            "seq_num":        seq_num,
+            "web_price_display": derived["web_price_display"],
+            "stock_summary":     derived["stock_summary"],
+        })
+
+        # 如果颜色是单一选中值，追加到标题
+        try:
+            vars_ = rec.get("variations") or {}
+            color_key = next((k for k in vars_.keys() if "color" in (k or "").lower()), None)
+            if color_key:
+                cv = vars_.get(color_key) or []
+                if isinstance(cv, list) and len(cv) == 1:
+                    color_val = _clean_ws(str(cv[0]))
+                    if color_val and color_val.lower() not in (rec["title"] or "").lower():
+                        rec["title"] = _clean_ws(f"{rec['title']} - {color_val}")
+        except Exception:
+            pass
+        if not rec["title"]:
+            rec["status"] = "PARSE_ERROR"
+
+        # 从 sku_prices attrs 补充 variations 中缺失的属性（如 Size: Double）
+        if sku_prices:
+            for sp in sku_prices:
+                for ak, av in (sp.get("attrs") or {}).items():
+                    if not ak or not av:
+                        continue
+                    exists = any(vk.lower() == ak.lower() for vk in rec["variations"])
+                    if not exists:
+                        all_vals = []
+                        seen_v = set()
+                        for sp2 in sku_prices:
+                            v2 = (sp2.get("attrs") or {}).get(ak, "")
+                            if v2 and v2 not in seen_v:
+                                seen_v.add(v2)
+                                all_vals.append(v2)
+                        if all_vals:
+                            rec["variations"][ak] = all_vals
+
+        # 生成 eBay title：AI 优先，失败 fallback 规则
+        _orig_t = rec.get("original_title", "")
+        _ai_title = _make_ebay_title_ai(_orig_t)
+        if _ai_title:
+            rec["ebay_title"] = _ai_title
+            print(f"  eBay title : {_ai_title} (AI)")
+        else:
+            rec["ebay_title"] = _make_ebay_title(
+                _orig_t, rec.get("variations", {})
+            )
+            print(f"  eBay title : {rec['ebay_title']} (fallback)")
+
+        seq = rec["seq_num"]
+        goods_imgs_count = len(rec.get("goods_imgs") or [])
+        print(f"  seq        : {seq}")
+        print(f"  title      : {rec['title'][:65]}")
+        print(f"  sku        : {rec['sku']}")
+        print(f"  price      : ${price:.2f}")
+        print(f"  shipping   : ${shipping:.2f}")
+        print(f"  store      : {rec['store_name']}")
+        print(f"  eBay price : ${ebay:.2f}")
+        print(f"  variations : {rec['variations']}")
+        print(f"  sku_prices : {len(sku_prices)} 个变体")
+        print(f"  goods_imgs : {goods_imgs_count} 张（JSON解析）")
+
+        base_dir = Path.cwd()
+        media_folder = _download_media(rec, base_dir, seq_num=seq)
+        _write_ebay_listing_txt(rec, media_folder)
+        first_img = _first_product_image_path(media_folder)
+        rec["first_image_path"] = str(first_img) if first_img else ""
+        if media_folder:
+            n_webp = len(list(Path(media_folder).glob("img_*.webp")))
+            n_img  = len(list(Path(media_folder).glob("img_*.*")))
+            n_vid  = len(list(Path(media_folder).glob("video_*.mp4")))
+            print(f"  media      : {n_img} image(s) ({n_webp} webp), {n_vid} video(s)")
+
+    except Exception as e:
+        rec["status"] = f"ERROR: {e}"
+        print(f"  ERROR: {e}")
+    finally:
+        # Each URL got its own tab — close it to avoid Chrome accumulation
+        if tab_id is not None:
+            _close_tab(CDP_PORT, tab_id)
+        _inter_url_pause()
+    return rec
+
+
 def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
-                 price_list=None):
+                 price_list=None, shipping_list=None, variant_filter_list=None):
     """
     抓取一个或多个 Shein 商品 URL，保存到 Excel。
 
@@ -2606,8 +2878,10 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
     output     : str               输出 .xlsx 文件名
     start_seq  : int               Excel 第一列序号起始值
     seq_list   : list[int] | None  每个 URL 对应的序号（用于 retry，覆盖 start_seq）
-    price_list : list[float|None] | None  每个 URL 对应的手动售价（USD）；非 None
-                 则覆盖网页爬取的 sale_price，并据此重算 shipping/eBay price
+    price_list : list[float|None] | None  每个 URL 对应的手动售价（USD，模板 C 列）；
+                 非 None 则覆盖网页爬取的 sale_price，并据此重算 eBay price
+    shipping_list       : list[float|None] | None  每个 URL 的手动运费（模板 D 列）
+    variant_filter_list : list[str] | None         每个 URL 的变体声明（模板 E 列）
     """
     if isinstance(urls, str):
         urls = [urls]
@@ -2620,296 +2894,39 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
         print(f"Chrome ready (existing session)  —  scraping {len(urls)} URL(s)\n")
 
     records = []
-    _consecutive_fails = 0
     _rate_limited = False
     try:
         try:
             import state_tracker as _st
         except Exception:
             _st = None
+
+        _reset_rate_limit_state()
         for i, url in enumerate(urls, 1):
-            print(f"[{i}/{len(urls)}] {url[:80]}...")
             if _st is not None:
                 try:
                     _st.url_progress(done=i - 1, total=len(urls), current_url=url)
                 except Exception:
                     pass
-            rec = {
-                "url": url,
-                "status": "OK",
-                "seq_num": seq_list[i - 1] if seq_list else start_seq + (i - 1),
-            }
-            tab_id = None
-            _url_start_time = time.monotonic()
-            try:
-                print("  navigating...")
-                ws_url, tab_id = _navigate_and_wait(CDP_PORT, url)
-
-                # 检测登录/验证码拦截
-                base_dir = Path.cwd()
-                if not _check_and_handle_block(CDP_PORT, tab_id, url, base_dir):
-                    rec["status"] = "BLOCKED"
-                    print("  [跳过] 页面被拦截，无法提取")
-                    records.append(rec)
-                    _inter_url_pause()
-                    continue
-                # 重置提取超时计时器：拦截处理（尤其验证码）可能耗时数分钟
-                _url_start_time = time.monotonic()
-
-                # 检测商品下架/404（Oops 页面）或数据未加载（[goods_name]）
-                _OOPS_DETECT_JS = """
-                    (function() {
-                        if (document.body && (
-                            document.body.innerText.includes('Oops') ||
-                            document.querySelector('.page-not-found, .error-page, [class*="not-found"]')
-                        )) return 'OOPS';
-                        if (document.title && document.title.includes('[goods_name]'))
-                            return 'NO_DATA';
-                        return 'OK';
-                    })()
-                """
-                try:
-                    _page_check = _run_js(ws_url, _OOPS_DETECT_JS)
-
-                    # OOPS 可能是真下架，也可能是 bot 软封禁。先退避重试一次再判定。
-                    if _page_check == "OOPS":
-                        _backoff = random.uniform(OOPS_RETRY_BACKOFF_MIN, OOPS_RETRY_BACKOFF_MAX)
-                        print(f"  [OOPS] 商品页显示 Oops — 退避 {_backoff:.0f}s 后重试...")
-                        time.sleep(_backoff)
-                        try:
-                            ws_url = _reload_tab_and_wait(CDP_PORT, tab_id)
-                            _page_check = _run_js(ws_url, _OOPS_DETECT_JS)
-                        except Exception:
-                            pass
-                        if _page_check == "OOPS":
-                            rec["status"] = "DELISTED"
-                            print("  [跳过] 重试后仍 Oops，判定真下架")
-                            records.append(rec)
-                            _consecutive_fails = 0
-                            _inter_url_pause()
-                            continue
-                        print(f"  [OOPS] 重试成功 (state={_page_check})，继续提取")
-                        # 重置计时器（退避耗时不计入提取超时）
-                        _url_start_time = time.monotonic()
-
-                    if _page_check == "NO_DATA":
-                        rec["status"] = "NO_DATA"
-                        print("  [跳过] 页面数据未加载 ([goods_name])")
-                        records.append(rec)
-                        _inter_url_pause()
-                        continue
-                except Exception:
-                    pass
-
-                # 滚动触发懒加载，稍等片刻
-                try:
-                    _run_js(ws_url, _JS_SCROLL_GALLERY)
-                    time.sleep(1.0)
-                    ws_url = _ws_url_for_id(CDP_PORT, tab_id)
-                except Exception:
-                    pass
-
-                data = None
-                for attempt in range(PAGE_LOAD_RETRIES):
-                    # 超时保护：如果单个页面总耗时超过 EXTRACTION_TIMEOUT_SEC
-                    _elapsed = time.monotonic() - _url_start_time
-                    if _elapsed > EXTRACTION_TIMEOUT_SEC:
-                        print(f"  [超时] 页面处理已超过 {EXTRACTION_TIMEOUT_SEC}s，可能被隐形拦截")
-                        # 二次验证码检测
-                        _recheck = None
-                        try:
-                            ws_url = _ws_url_for_id(CDP_PORT, tab_id)
-                            _recheck = _run_js(ws_url, _JS_DETECT_BLOCK)
-                        except Exception:
-                            pass
-                        # 无论是否检测到验证码，都截图通知
-                        ss_path = str(_screenshots_dir(base_dir) / f"_timeout_{time.strftime('%Y%m%d_%H%M%S')}.png")
-                        try:
-                            ws_url = _ws_url_for_id(CDP_PORT, tab_id)
-                            _take_screenshot(ws_url, ss_path)
-                        except Exception:
-                            ss_path = None
-                        _block_info = ""
-                        if isinstance(_recheck, dict) and _recheck.get("blocked"):
-                            _block_info = f"\n检测到拦截类型: {_recheck.get('type', 'unknown')}"
-                        alert_generic(
-                            url,
-                            f"页面处理超时（{_elapsed:.0f}s > {EXTRACTION_TIMEOUT_SEC}s），"
-                            f"可能存在隐形验证码或页面加载异常。{_block_info}",
-                            screenshot_path=ss_path,
-                        )
-                        rec["status"] = "TIMEOUT"
-                        data = None
-                        break
-
-                    print("  extracting...")
-                    data = _run_js(ws_url, _JS)
-                    if isinstance(data, dict) and not _shein_page_needs_retry(data):
-                        break
-                    if attempt < PAGE_LOAD_RETRIES - 1:
-                        print(
-                            f"  transient/error page (try {attempt + 1}/{PAGE_LOAD_RETRIES}), "
-                            "reloading..."
-                        )
-                        time.sleep(RELOAD_PAUSE_SEC)
-                        ws_url = _reload_tab_and_wait(CDP_PORT, tab_id)
-
-                if rec.get("status") == "TIMEOUT":
-                    print("  [跳过] 页面超时")
-                    records.append(rec)
-                    _inter_url_pause()
-                    continue  # tab closed by finally
-
-                if not isinstance(data, dict):
-                    raise ValueError("JS returned unexpected type — page may not have loaded")
-
-                # 颜色变体修正：DOM 在预选颜色(?main_attr=...)时只拿到选中的一个，
-                # 用 mainSaleAttribute 的完整颜色清单补全 variations
-                data["variations"] = _merge_main_sale_attr_colors(
-                    data.get("variations") or {}, data.get("main_sale_attrs") or [])
-
-                # 手动售价覆盖：C 列价格替代网页爬到的 sale_price（用户填写更可靠）
-                # 同时把每个 sku_prices 变体的 sale_price 也改成 C 列价格，
-                # 这样下游"各变体价格"、变体子行、Variation 2 显示等都用同一价格。
-                override_price = (price_list[i - 1] if price_list else None)
-                if override_price is not None:
-                    web_price = data.get("price")
-                    op = float(override_price)
-                    data["price"] = op
-                    for _sp in (data.get("sku_prices") or []):
-                        _sp["sale_price"] = op
-                    print(f"  [price override] C列=${op:.2f} "
-                          f"(网页=${(web_price or 0):.2f}, "
-                          f"sku_prices×{len(data.get('sku_prices') or [])} 同步)")
-
-                shipping = _calc_shipping(data)
-                price    = data.get("price") or 0.0
-                ebay     = _ebay_listing_price(price, shipping)
-                thresh   = data.get("free_threshold")
-
-                ship_note = (
-                    f"threshold=${thresh:.2f} — price ${price:.2f} "
-                    f"{'≥ threshold → FREE' if price >= thresh else '< threshold → $' + str(DEFAULT_SHIPPING_FEE)}"
-                    if thresh is not None else
-                    "unconditional FREE" if data.get("unconditional_free") else
-                    f"no shipping info → default ${DEFAULT_SHIPPING_FEE}"
-                )
-
-                sku_prices = data.get("sku_prices") or []
-                rec.update({
-                    "sku":            data.get("goods_sn") or data.get("goods_id", ""),
-                    "price":          price,
-                    "shipping":       shipping,
-                    "website":        "us.shein.com",
-                    "store_name":     data.get("store_name", ""),
-                    "original_title": data.get("title", ""),
-                    "title":          data.get("title", ""),
-                    "variations":     data.get("variations", {}),
-                    "ebay_price":     ebay,
-                    "media":          data.get("media", {}),
-                    "goods_imgs":     data.get("goods_imgs") or [],
-                    "sku_prices":     sku_prices,
-                    "main_sale_attrs": data.get("main_sale_attrs") or [],
-                    "seq_num":        seq_list[i - 1] if seq_list else start_seq + (i - 1),
-                })
-
-                # 如果颜色是单一选中值，追加到标题
-                try:
-                    vars_ = rec.get("variations") or {}
-                    color_key = next((k for k in vars_.keys() if "color" in (k or "").lower()), None)
-                    if color_key:
-                        cv = vars_.get(color_key) or []
-                        if isinstance(cv, list) and len(cv) == 1:
-                            color_val = _clean_ws(str(cv[0]))
-                            if color_val and color_val.lower() not in (rec["title"] or "").lower():
-                                rec["title"] = _clean_ws(f"{rec['title']} - {color_val}")
-                except Exception:
-                    pass
-                if not rec["title"]:
-                    rec["status"] = "PARSE_ERROR"
-
-                # 从 sku_prices attrs 补充 variations 中缺失的属性（如 Size: Double）
-                if sku_prices:
-                    for sp in sku_prices:
-                        for ak, av in (sp.get("attrs") or {}).items():
-                            if not ak or not av:
-                                continue
-                            exists = any(vk.lower() == ak.lower() for vk in rec["variations"])
-                            if not exists:
-                                all_vals = []
-                                seen_v = set()
-                                for sp2 in sku_prices:
-                                    v2 = (sp2.get("attrs") or {}).get(ak, "")
-                                    if v2 and v2 not in seen_v:
-                                        seen_v.add(v2)
-                                        all_vals.append(v2)
-                                if all_vals:
-                                    rec["variations"][ak] = all_vals
-
-                # 生成 eBay title：AI 优先，失败 fallback 规则
-                _orig_t = rec.get("original_title", "")
-                _ai_title = _make_ebay_title_ai(_orig_t)
-                if _ai_title:
-                    rec["ebay_title"] = _ai_title
-                    print(f"  eBay title : {_ai_title} (AI)")
-                else:
-                    rec["ebay_title"] = _make_ebay_title(
-                        _orig_t, rec.get("variations", {})
-                    )
-                    print(f"  eBay title : {rec['ebay_title']} (fallback)")
-
-                seq = rec["seq_num"]
-                goods_imgs_count = len(rec.get("goods_imgs") or [])
-                print(f"  seq        : {seq}")
-                print(f"  title      : {rec['title'][:65]}")
-                print(f"  sku        : {rec['sku']}")
-                print(f"  price      : ${price:.2f}")
-                print(f"  shipping   : ${shipping:.2f}  ({ship_note})")
-                print(f"  store      : {rec['store_name']}")
-                print(f"  eBay price : ${ebay:.2f}")
-                print(f"  variations : {rec['variations']}")
-                print(f"  sku_prices : {len(sku_prices)} 个变体")
-                print(f"  goods_imgs : {goods_imgs_count} 张（JSON解析）")
-
-                base_dir = Path.cwd()
-                media_folder = _download_media(rec, base_dir, seq_num=seq)
-                _write_ebay_listing_txt(rec, media_folder)
-                first_img = _first_product_image_path(media_folder)
-                rec["first_image_path"] = str(first_img) if first_img else ""
-                if media_folder:
-                    n_webp = len(list(Path(media_folder).glob("img_*.webp")))
-                    n_img  = len(list(Path(media_folder).glob("img_*.*")))
-                    n_vid  = len(list(Path(media_folder).glob("video_*.mp4")))
-                    print(f"  media      : {n_img} image(s) ({n_webp} webp), {n_vid} video(s)")
-
-            except Exception as e:
-                rec["status"] = f"ERROR: {e}"
-                print(f"  ERROR: {e}")
-            finally:
-                # Each URL got its own tab — close it to avoid Chrome accumulation
-                if tab_id is not None:
-                    _close_tab(CDP_PORT, tab_id)
-
+            rec = _scrape_one_url(
+                url, i, len(urls),
+                seq_list[i - 1] if seq_list else start_seq + (i - 1),
+                price_list[i - 1] if price_list else None,
+                shipping_list[i - 1] if shipping_list else None,
+                variant_filter_list[i - 1] if variant_filter_list else "",
+            )
             records.append(rec)
-
-            # 限流检测：连续失败 N 次则停止
-            if rec.get("status") != "OK":
-                _consecutive_fails += 1
-                if _consecutive_fails >= RATE_LIMIT_CONSECUTIVE:
-                    print(f"\n  [限流] 连续 {_consecutive_fails} 个 URL 失败，判定为 Shein 限流，停止当前批次")
-                    for j in range(i + 1, len(urls) + 1):
-                        if j <= len(urls):
-                            records.append({
-                                "url": urls[j - 1],
-                                "status": "RATE_LIMITED",
-                                "seq_num": seq_list[j - 1] if seq_list else start_seq + (j - 1),
-                            })
-                    _rate_limited = True
-                    break
-            else:
-                _consecutive_fails = 0
-
-            _inter_url_pause()
+            if _record_result_for_rate_limit(rec.get("status") or "OK"):
+                print(f"\n  [限流] 连续 {RATE_LIMIT_CONSECUTIVE} 个 URL 失败，"
+                      f"判定为 Shein 限流，停止当前批次")
+                for j in range(i + 1, len(urls) + 1):
+                    records.append({
+                        "url": urls[j - 1],
+                        "status": "RATE_LIMITED",
+                        "seq_num": seq_list[j - 1] if seq_list else start_seq + (j - 1),
+                    })
+                _rate_limited = True
+                break
 
     finally:
         if launched_new and chrome_proc is not None and not KEEP_CHROME_OPEN:
