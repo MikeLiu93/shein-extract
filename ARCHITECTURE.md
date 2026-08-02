@@ -73,7 +73,7 @@ Each **worksheet = one store** (e.g. `B4`, `L8`, `Test1`)
 - `check_stock.py` processes rows where **Status == "Done"**
 - Columns A, B, C are **never modified** by any script
 - Column C (Price), if filled, replaces the web-scraped sale price for that row. The
-  eBay listing price formula stays `max(price + shipping, $22) × 1.4`, but `price`
+  eBay listing price formula stays `(price + shipping) × 1.4`, but `price`
   comes from column C instead of the web. If column C is empty, the scraper falls
   back to the web sale price.
 

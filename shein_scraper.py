@@ -29,7 +29,7 @@ EXCEL COLUMNS:
   7. Product URL  原始链接
   8. Store name   店铺名称
   9. Title        商品标题
-  10. eBay price  max(Price+Shipping, 22) × 1.4
+  10. eBay price  (Price+Shipping) × 1.4
   11. Variation 1 第一个变体属性（含单值属性）
   12. Variation 2 第二个变体属性（含单值属性）
   13. eBay Title  eBay 上架标题
@@ -63,7 +63,6 @@ from openpyxl.utils.cell import coordinate_to_tuple
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 DEFAULT_SHIPPING_FEE   = 2.99
-EBAY_MIN_SUBTOTAL      = float(os.environ.get("SHEIN_EBAY_MIN_SUBTOTAL", "22"))
 EBAY_MARKUP            = float(os.environ.get("SHEIN_EBAY_MARKUP", "1.4"))
 CDP_PORT               = 9222
 PAGE_LOAD_MIN_WAIT     = 3        # 最少等待秒数（让 JS 初始化）
@@ -1226,7 +1225,7 @@ def _calc_shipping(data):
 
 def _ebay_listing_price(price: float, shipping: float) -> float:
     base = float(price or 0) + float(shipping or 0)
-    return round(max(base, EBAY_MIN_SUBTOTAL) * EBAY_MARKUP, 2)
+    return round(base * EBAY_MARKUP, 2)
 
 
 def _merge_main_sale_attr_colors(variations: dict, main_sale_attrs: list) -> dict:
