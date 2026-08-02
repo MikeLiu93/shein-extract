@@ -1350,6 +1350,67 @@ def _format_stock_summary(sku_prices: list) -> str:
     return " / ".join(parts)
 
 
+def _apply_row_overrides(data: dict, override_price, override_shipping,
+                         variant_filter_decl: str) -> dict:
+    """把模板 C / D / E 三列的覆盖套到刚抓下来的 `data` 上（就地修改），
+    返回写 Excel 需要的一组派生值。
+
+    顺序不可调换：过滤 → 网页价区间 → C 列覆盖 → 运费 → eBay 价 → 库存串。
+    网页价区间必须在 C 列覆盖 *之前* 算，因为 I 列的用途就是核对 C 列填得对不对。
+    """
+    decl = (variant_filter_decl or "").strip()
+    sku_prices = data.get("sku_prices") or []
+    variations = data.get("variations") or {}
+
+    kept, filtered_vars, unknown = _filter_variants_by_declaration(
+        decl, sku_prices, variations)
+
+    if decl and not kept:
+        return {
+            "price": data.get("price") or 0.0,
+            "shipping": 0.0,
+            "ebay_price": 0.0,
+            "web_price_display": None,
+            "stock_summary": "",
+            "unknown_variants": unknown,
+            "variant_filter_no_match": True,
+        }
+
+    data["sku_prices"] = kept
+    if decl:
+        data["variations"] = filtered_vars
+
+    # I 列：覆盖之前的网页价
+    web_price_display = _format_price_range(kept)
+    if web_price_display is None:
+        web_price_display = data.get("price")
+
+    if override_price is not None:
+        op = float(override_price)
+        data["price"] = op
+        for sp in kept:
+            sp["sale_price"] = op
+        print(f"  [price override] C列=${op:.2f} "
+              f"(网页={web_price_display}, sku_prices×{len(kept)} 同步)")
+
+    price = data.get("price") or 0.0
+    if override_shipping is not None:
+        shipping = float(override_shipping)
+        print(f"  [shipping override] D列=${shipping:.2f}")
+    else:
+        shipping = _calc_shipping(data)
+
+    return {
+        "price": price,
+        "shipping": shipping,
+        "ebay_price": _ebay_listing_price(price, shipping),
+        "web_price_display": web_price_display,
+        "stock_summary": _format_stock_summary(kept),
+        "unknown_variants": unknown,
+        "variant_filter_no_match": False,
+    }
+
+
 def _merge_main_sale_attr_colors(variations: dict, main_sale_attrs: list) -> dict:
     """mainSaleAttribute 是颜色变体的权威清单（每个颜色 = 独立 goods_sn）。
 
