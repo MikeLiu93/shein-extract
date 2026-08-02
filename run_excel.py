@@ -186,61 +186,38 @@ def safe_save(wb, xlsx_path: Path) -> None:
 
 
 def process_excel(xlsx_path: Path) -> None:
-    """Process all worksheets in an Excel file."""
+    """按中文表头模板处理 `xlsx_path` 里的每个 sheet。非模板 sheet 跳过。
+    列定义见模块 docstring 和 design spec §1。"""
     logger.info("Opening: %s", xlsx_path.name)
     wb = load_workbook(xlsx_path)
 
     for ws_name in wb.sheetnames:
         ws = wb[ws_name]
         store = ws_name.strip()
-        logger.info("Sheet: %s", store)
-
-        # Normalize headers: col C = Price, col D = Date
-        if str(ws.cell(1, 3).value or "").strip() == "":
-            ws.cell(1, 3).value = "Price"
-        header_d = str(ws.cell(1, 4).value or "").strip()
-        if header_d in ("Execute Date", ""):
-            ws.cell(1, 4).value = "Date"
-
-        # Collect pending rows (Date AND Status both empty)
-        pending = []
-        for row in range(2, ws.max_row + 1):
-            seq = ws.cell(row, 1).value
-            url = ws.cell(row, 2).value
-            price_val = ws.cell(row, 3).value
-            date_val = ws.cell(row, 4).value
-            status_val = ws.cell(row, 5).value
-            if url and seq is not None and not date_val and not status_val:
-                try:
-                    price_f = float(price_val) if price_val not in (None, "") else None
-                except (TypeError, ValueError):
-                    price_f = None
-                pending.append((row, int(seq), str(url).strip(), price_f))
-
-        if not pending:
-            logger.info("  No pending rows in '%s'", store)
+        if not _sheet_matches_template(ws):
+            logger.warning("  Sheet '%s': 不是中文模板（B1 不是「链接」），跳过", store)
             continue
 
-        logger.info("  %d pending URL(s): seq %s",
-                     len(pending), [p[1] for p in pending])
+        pending = _read_pending_rows(ws)
+        if not pending:
+            logger.info("  Sheet '%s': 没有待处理的行", store)
+            continue
 
-        # Prepare output folder
+        logger.info("  Sheet '%s': %d 行待处理: seq %s",
+                    store, len(pending), [p["seq"] for p in pending])
+
         store_dir = OUTPUT_ROOT / store
         store_dir.mkdir(parents=True, exist_ok=True)
 
-        # Run scraper
-        urls = [p[2] for p in pending]
-        seqs = [p[1] for p in pending]
-        prices = [p[3] for p in pending]
         today = datetime.now().strftime("%Y-%m-%d")
+        seqs = [p["seq"] for p in pending]
         seq_min, seq_max = min(seqs), max(seqs)
-        xlsx_name = f"{store}-{seq_min}-{seq_max}-{today.replace('-', '')}.xlsx"
+        batch_xlsx = f"{store}-{seq_min}-{seq_max}-{today.replace('-', '')}.xlsx"
 
-        # screenshots/ subfolder is created lazily by the scraper itself
         old_cwd = Path.cwd()
         results = None
         try:
-            # Google Drive sync may briefly lock new folders
+            # Google Drive 同步偶尔会短暂锁住新建目录
             for _retry in range(5):
                 try:
                     os.chdir(store_dir)
@@ -248,10 +225,16 @@ def process_excel(xlsx_path: Path) -> None:
                 except PermissionError:
                     time.sleep(2)
             else:
-                os.chdir(store_dir)  # final attempt, let it raise
-            logger.info("  Scraping %d URLs → %s/%s", len(urls), store, xlsx_name)
-            results = scrape_shein(urls, output=xlsx_name, seq_list=seqs,
-                                   price_list=prices)
+                os.chdir(store_dir)   # 最后一次，让它抛
+            logger.info("  Scraping %d URLs → %s/%s", len(pending), store, batch_xlsx)
+            results = scrape_shein(
+                [p["url"] for p in pending],
+                output=batch_xlsx,
+                seq_list=seqs,
+                price_list=[p["price"] for p in pending],
+                shipping_list=[p["shipping"] for p in pending],
+                variant_filter_list=[p["variant_filter"] for p in pending],
+            )
         except RateLimitError:
             logger.warning("  [限流] Rate limited during '%s'", store)
         except Exception as e:
@@ -264,45 +247,48 @@ def process_excel(xlsx_path: Path) -> None:
         finally:
             os.chdir(old_cwd)
 
-        # Update Date + Status based on results
-        for row_idx, seq, url, _price in pending:
+        # 把结果扇回模板行
+        for p in pending:
+            row, seq = p["row"], p["seq"]
             seq_folder = store_dir / str(seq)
             has_files = seq_folder.is_dir() and any(seq_folder.iterdir())
 
-            # Determine status from result record
             rec = None
             if results:
                 rec = next((r for r in results if r.get("seq_num") == seq), None)
 
-            # A record with empty SKU or [goods_name] title is not a real success
+            # SKU 为空或标题里还带 [goods_name] 的，不算真成功
             is_bad_data = (rec and rec.get("status") == "OK"
                            and (not rec.get("sku")
                                 or "[goods_name]" in (rec.get("title") or "")))
 
-            if has_files and not is_bad_data:
-                ws.cell(row_idx, 4).value = today
-                ws.cell(row_idx, 5).value = "Done"
+            if rec and has_files and not is_bad_data and rec.get("status") == "OK":
+                _write_result_row(
+                    ws, row=row, date=today, status="Done",
+                    picture_path=rec.get("first_image_path") or None,
+                    web_price=rec.get("web_price_display"),
+                    shein_title=rec.get("original_title") or rec.get("title"),
+                    ebay_title=rec.get("ebay_title"),
+                    ebay_price=rec.get("ebay_price"),
+                    stock=rec.get("stock_summary"),
+                )
                 logger.info("    seq %d → Done", seq)
             elif rec and rec.get("status") == "DELISTED":
-                ws.cell(row_idx, 4).value = today
-                ws.cell(row_idx, 5).value = "Delisted"
+                _write_result_row(ws, row=row, date=today, status="Delisted")
                 logger.info("    seq %d → Delisted", seq)
             else:
                 detail = rec.get("status", "") if rec else ""
                 if is_bad_data:
                     detail = "no data loaded"
-                ws.cell(row_idx, 4).value = today
-                ws.cell(row_idx, 5).value = "Failed"
+                _write_result_row(ws, row=row, date=today, status="Failed")
                 logger.info("    seq %d → Failed %s", seq,
                             f"({detail})" if detail else "")
 
-        # Save after each store (so progress isn't lost)
         safe_save(wb, xlsx_path)
         logger.info("  Saved progress to %s", xlsx_path.name)
 
     wb.close()
     logger.info("Done: %s", xlsx_path.name)
-
 
 def main():
     parser = argparse.ArgumentParser(
