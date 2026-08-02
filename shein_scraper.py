@@ -70,13 +70,9 @@ PAGE_LOAD_MAX_WAIT     = 20       # 最多等待秒数（轮询 goods_sn）
 PAGE_LOAD_POLL_INTERVAL = 0.5     # 轮询间隔秒数
 PAGE_LOAD_RETRIES      = 3        # 遇到错误页面的最大重试次数
 RELOAD_PAUSE_SEC       = 2
-# Inter-URL pacing (anti-rate-limit). Random jitter + occasional long pauses
-# look less robotic than a fixed delay.
-INTER_URL_DELAY_MIN    = 4        # 每个商品之间最短间隔（秒）
-INTER_URL_DELAY_MAX    = 12       # 每个商品之间最长间隔（秒）
-LONG_PAUSE_EVERY       = 18       # 每处理 N 个商品后插一段长歇
-LONG_PAUSE_MIN         = 30       # 长歇最短秒数
-LONG_PAUSE_MAX         = 90       # 长歇最长秒数
+# Inter-URL pacing. 每个 URL 抓完之后睡 2–3 秒，没有长歇。
+INTER_URL_PAUSE_MIN    = 2.0      # 间隔下限（秒）
+INTER_URL_PAUSE_MAX    = 3.0      # 间隔上限（秒）
 # OOPS retry backoff: Shein 软封禁经常返回 "Oops" 假页面，先退避重试再判 DELISTED
 OOPS_RETRY_BACKOFF_MIN = 30
 OOPS_RETRY_BACKOFF_MAX = 60
@@ -92,18 +88,12 @@ IMAGE_DOWNLOAD_WORKERS = 8        # 并行下载线程数
 LOW_STOCK_THRESHOLD    = 15       # stock <= 此值标记 [少货]
 
 
-def _inter_url_pause(i: int, total: int) -> None:
-    """Sleep between URLs. Skip after last. Random jitter + occasional long pause."""
-    if i >= total:
-        return
-    delay = random.uniform(INTER_URL_DELAY_MIN, INTER_URL_DELAY_MAX)
-    if i > 0 and i % LONG_PAUSE_EVERY == 0:
-        long_pause = random.uniform(LONG_PAUSE_MIN, LONG_PAUSE_MAX)
-        print(f"  [节奏] 已处理 {i} 条 — 长歇 {long_pause:.0f}s + 间隔 {delay:.1f}s")
-        time.sleep(long_pause + delay)
-    else:
-        print(f"  [节奏] 间隔 {delay:.1f}s")
-        time.sleep(delay)
+def _inter_url_pause() -> None:
+    """每抓完一条 URL 之后睡 2–3 秒。worker 无条件调用——包括它手上的最后一条。
+    并发下判断「谁是最后一条」不可靠，代价只是整批多等 ≤3 秒。"""
+    delay = random.uniform(INTER_URL_PAUSE_MIN, INTER_URL_PAUSE_MAX)
+    print(f"  [节奏] 间隔 {delay:.1f}s")
+    time.sleep(delay)
 
 
 _CHROME_PATHS = [
@@ -2600,7 +2590,7 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
                     rec["status"] = "BLOCKED"
                     print("  [跳过] 页面被拦截，无法提取")
                     records.append(rec)
-                    _inter_url_pause(i, len(urls))
+                    _inter_url_pause()
                     continue
                 # 重置提取超时计时器：拦截处理（尤其验证码）可能耗时数分钟
                 _url_start_time = time.monotonic()
@@ -2635,7 +2625,7 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
                             print("  [跳过] 重试后仍 Oops，判定真下架")
                             records.append(rec)
                             _consecutive_fails = 0
-                            _inter_url_pause(i, len(urls))
+                            _inter_url_pause()
                             continue
                         print(f"  [OOPS] 重试成功 (state={_page_check})，继续提取")
                         # 重置计时器（退避耗时不计入提取超时）
@@ -2645,7 +2635,7 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
                         rec["status"] = "NO_DATA"
                         print("  [跳过] 页面数据未加载 ([goods_name])")
                         records.append(rec)
-                        _inter_url_pause(i, len(urls))
+                        _inter_url_pause()
                         continue
                 except Exception:
                     pass
@@ -2706,7 +2696,7 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
                 if rec.get("status") == "TIMEOUT":
                     print("  [跳过] 页面超时")
                     records.append(rec)
-                    _inter_url_pause(i, len(urls))
+                    _inter_url_pause()
                     continue  # tab closed by finally
 
                 if not isinstance(data, dict):
@@ -2858,7 +2848,7 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
             else:
                 _consecutive_fails = 0
 
-            _inter_url_pause(i, len(urls))
+            _inter_url_pause()
 
     finally:
         if launched_new and chrome_proc is not None and not KEEP_CHROME_OPEN:
