@@ -1228,6 +1228,55 @@ def _ebay_listing_price(price: float, shipping: float) -> float:
     return round(base * EBAY_MARKUP, 2)
 
 
+def _format_price_range(sku_prices: list):
+    """I 列（希音价格）。所有变体价格相同 → 返回数字（让 Excel 当数值处理）；
+    不同 → 返回字符串区间 'LO–HI'（en-dash U+2013，不带货币符号）；
+    没有任何有效价格 → None。None / 非数字的 sale_price 直接忽略。"""
+    prices = []
+    for sp in sku_prices or []:
+        p = sp.get("sale_price")
+        if p is None:
+            continue
+        try:
+            prices.append(float(p))
+        except (TypeError, ValueError):
+            continue
+    if not prices:
+        return None
+    lo, hi = min(prices), max(prices)
+    if lo == hi:
+        return round(lo, 2)
+    return f"{lo:.2f}–{hi:.2f}"
+
+
+def _format_stock_summary(sku_prices: list) -> str:
+    """M 列（库存）单行摘要。
+
+    格式：'<标签>: <数量>'，条目之间用 ' / ' 连接。标签是属性值按插入顺序
+    用连字符拼起来（如 'Black-M'）；没有属性时退回 sku_code。数量为 0 → 缺货，
+    1..LOW_STOCK_THRESHOLD → '少货 N'，更大 → 纯数字。
+    """
+    def _label(sp: dict) -> str:
+        vals = [str(v).strip() for v in (sp.get("attrs") or {}).values() if v]
+        if vals:
+            return "-".join(vals)
+        return str(sp.get("sku_code") or "").strip() or "?"
+
+    def _count(sp: dict) -> str:
+        try:
+            stk = int(sp.get("stock") or 0)
+        except (TypeError, ValueError):
+            stk = 0
+        if stk == 0:
+            return "缺货"
+        if stk <= LOW_STOCK_THRESHOLD:
+            return f"少货 {stk}"
+        return str(stk)
+
+    parts = [f"{_label(sp)}: {_count(sp)}" for sp in (sku_prices or [])]
+    return " / ".join(parts)
+
+
 def _merge_main_sale_attr_colors(variations: dict, main_sale_attrs: list) -> dict:
     """mainSaleAttribute 是颜色变体的权威清单（每个颜色 = 独立 goods_sn）。
 
