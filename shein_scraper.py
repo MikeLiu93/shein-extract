@@ -1228,6 +1228,89 @@ def _ebay_listing_price(price: float, shipping: float) -> float:
     return round(base * EBAY_MARKUP, 2)
 
 
+def _filter_variants_by_declaration(
+    declaration: str,
+    sku_prices: list,
+    variations: dict,
+) -> tuple[list, dict, list]:
+    """按模板 E 列（变体）的声明限制 sku_prices 和 variations。
+
+    `declaration` 语法：
+      - 空 / 全空白 → 不过滤，原样返回输入。
+      - 不含 "/"    → 扁平白名单；SKU 的任一属性值命中即保留
+                      （忽略大小写和首尾空格）。
+      - 含 "/"      → 组之间用 "/" 分隔、组内用逗号分隔。SKU 只有在
+                      **每个非空组**都至少命中一个值时才保留。
+
+    返回 (kept_sku_prices, filtered_variations, unknown_values)。
+    `unknown_values` 是声明里从未匹配上任何保留变体的值，调用方打 warning。
+    声明非空但一个都没匹配上 → kept 为 []、filtered_variations 为 {}。
+    """
+    decl = (declaration or "").strip()
+    if not decl:
+        return sku_prices, variations, []
+
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+    groups = [
+        [_norm(v) for v in grp.split(",") if _norm(v)]
+        for grp in decl.split("/")
+    ]
+    groups = [g for g in groups if g]  # 丢掉空组
+    if not groups:
+        return sku_prices, variations, []
+
+    # 归一化值 → 用户原始大小写，用于报告 unknown
+    all_declared_norm: dict[str, str] = {}
+    for grp in decl.split("/"):
+        for v in grp.split(","):
+            n = _norm(v)
+            if n:
+                all_declared_norm[n] = v.strip()
+
+    def _sku_matches(sku: dict) -> bool:
+        attr_values = {_norm(v) for v in (sku.get("attrs") or {}).values() if v}
+        if len(groups) == 1:
+            return bool(attr_values & set(groups[0]))
+        return all(bool(attr_values & set(g)) for g in groups)
+
+    kept = [s for s in sku_prices if _sku_matches(s)]
+
+    # seen 只从 kept 里统计：出现在被拒变体上的声明值仍算 unknown
+    seen_norm: set[str] = set()
+    for sp in kept:
+        for v in (sp.get("attrs") or {}).values():
+            n = _norm(v)
+            if n in all_declared_norm:
+                seen_norm.add(n)
+
+    unknown = sorted(all_declared_norm[n]
+                     for n in set(all_declared_norm) - seen_norm)
+
+    if not kept:
+        return [], {}, sorted(all_declared_norm.values())
+
+    # 用保留下来的 SKU 重建 variations，让下游（标题 / txt / M 列）只看到声明的值
+    filtered_vars: dict[str, list] = {}
+    for sp in kept:
+        for k, v in (sp.get("attrs") or {}).items():
+            if not v:
+                continue
+            filtered_vars.setdefault(k, [])
+            if v not in filtered_vars[k]:
+                filtered_vars[k].append(v)
+    # 原 variations 里没被 SKU attrs 覆盖的键（罕见的扁平属性）：值命中声明就保留
+    for k, vals in (variations or {}).items():
+        if k in filtered_vars or not isinstance(vals, list):
+            continue
+        keep = [v for v in vals if _norm(v) in all_declared_norm]
+        if keep:
+            filtered_vars[k] = keep
+
+    return kept, filtered_vars, unknown
+
+
 def _format_price_range(sku_prices: list):
     """I 列（希音价格）。所有变体价格相同 → 返回数字（让 Excel 当数值处理）；
     不同 → 返回字符串区间 'LO–HI'（en-dash U+2013，不带货币符号）；
