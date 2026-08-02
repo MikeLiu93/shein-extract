@@ -78,13 +78,14 @@ OOPS_RETRY_BACKOFF_MIN = 30
 OOPS_RETRY_BACKOFF_MAX = 60
 EXTRACTION_TIMEOUT_SEC = 60       # 单个页面提取超时（秒），正常3-5s加载，超过60s视为失败
 RATE_LIMIT_CONSECUTIVE  = 3       # 连续失败 N 次视为限流，停止当前批次
+MAX_PARALLEL_TABS      = 3        # 同时打开多少个 CDP tab 抓取（保守）
 PICTURE_MAX_HEIGHT_PX  = 168
 KEEP_CHROME_OPEN       = True
 PERSISTENT_PROFILE_DIR = os.path.join(os.path.expanduser("~"), "shein-cdp-profile")
 OUTPUT_ENCODING        = "utf-8"
 MEDIA_FOLDER_PREFIX    = "图片-"
 EBAY_LISTING_TXT_NAME  = "eBay上架描述.txt"
-IMAGE_DOWNLOAD_WORKERS = 8        # 并行下载线程数
+IMAGE_DOWNLOAD_WORKERS = 4        # 并行下载线程数（3 并发商品 × 4 = 12 sockets）
 LOW_STOCK_THRESHOLD    = 15       # stock <= 此值标记 [少货]
 
 
@@ -2867,6 +2868,89 @@ def _scrape_one_url(
     return rec
 
 
+def _run_scrape_pool(urls, seq_list, price_list, shipping_list,
+                     variant_filter_list, start_seq, progress_cb=None):
+    """用 MAX_PARALLEL_TABS 个并发 tab 跑完 `urls`，返回 (records, rate_limited)。
+
+    一个持久的 ThreadPoolExecutor 覆盖整个列表（不分批）。每个 worker 抓完
+    自己那条之后会睡 2–3 秒（在 `_scrape_one_url` 的 finally 里），所以池子
+    自然把整体速率压到约 MAX_PARALLEL_TABS / 2.5s。
+
+    限流触发时：不再提交新任务，但**先排空所有已经完成的 future**，
+    把它们的结果收进来——否则整批已经抓好的商品会被一起丢掉。
+    剩下的没跑到的 URL 标成 RATE_LIMITED。records 按 seq_num 升序返回。
+    """
+    total = len(urls)
+    _reset_rate_limit_state()
+
+    def _seq(i):
+        return seq_list[i] if seq_list else start_seq + i
+
+    records = []
+    rate_limited = False
+    done_count = 0
+    lock = threading.Lock()
+
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_TABS) as ex:
+        fut_to_seq = {}
+        for i in range(total):
+            fut = ex.submit(
+                _scrape_one_url,
+                urls[i], i + 1, total, _seq(i),
+                price_list[i] if price_list else None,
+                shipping_list[i] if shipping_list else None,
+                variant_filter_list[i] if variant_filter_list else "",
+            )
+            fut_to_seq[fut] = (i, _seq(i))
+
+        for fut in as_completed(fut_to_seq):
+            i, seq_num = fut_to_seq[fut]
+            try:
+                rec = fut.result()
+            except Exception as e:
+                rec = {"url": urls[i], "status": f"ERROR: {e}", "seq_num": seq_num}
+            records.append(rec)
+            with lock:
+                done_count += 1
+                done = done_count
+            if progress_cb is not None:
+                try:
+                    progress_cb(done, total, rec.get("url", ""))
+                except Exception:
+                    pass
+            if _record_result_for_rate_limit(rec.get("status") or "OK"):
+                rate_limited = True
+                print(f"\n  [限流] 连续 {RATE_LIMIT_CONSECUTIVE} 个 URL 失败，"
+                      f"判定为 Shein 限流，停止提交后续 URL")
+                # 取消还没开始的任务；已在跑的让它跑完（tab 得关掉）
+                for other in fut_to_seq:
+                    if not other.done():
+                        other.cancel()
+                break
+
+    # 排空：上面 break 之后（以及 with 块退出时）陆续完成的 future
+    collected = {r.get("seq_num") for r in records}
+    for fut, (i, seq_num) in fut_to_seq.items():
+        if seq_num in collected or fut.cancelled() or not fut.done():
+            continue
+        try:
+            rec = fut.result()
+        except Exception as e:
+            rec = {"url": urls[i], "status": f"ERROR: {e}", "seq_num": seq_num}
+        records.append(rec)
+        collected.add(seq_num)
+
+    if rate_limited:
+        for i in range(total):
+            if _seq(i) not in collected:
+                records.append({"url": urls[i], "status": "RATE_LIMITED",
+                                "seq_num": _seq(i)})
+                collected.add(_seq(i))
+
+    records.sort(key=lambda r: (r.get("seq_num") or 0))
+    return records, rate_limited
+
+
 def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
                  price_list=None, shipping_list=None, variant_filter_list=None):
     """
@@ -2901,32 +2985,22 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
         except Exception:
             _st = None
 
-        _reset_rate_limit_state()
-        for i, url in enumerate(urls, 1):
+        # 会话预热一次，在建池之前。_ensure_shein_session 靠模块级
+        # _SESSION_WARMED 去重，但那个标志没加锁——三个 worker 同时起来会
+        # 一起看到 False 从而重复预热。先跑一次把标志置上，race 就不存在了。
+        _ensure_shein_session(CDP_PORT)
+
+        def _progress(done, total_n, url_hint):
             if _st is not None:
                 try:
-                    _st.url_progress(done=i - 1, total=len(urls), current_url=url)
+                    _st.url_progress(done=done, total=total_n, current_url=url_hint)
                 except Exception:
                     pass
-            rec = _scrape_one_url(
-                url, i, len(urls),
-                seq_list[i - 1] if seq_list else start_seq + (i - 1),
-                price_list[i - 1] if price_list else None,
-                shipping_list[i - 1] if shipping_list else None,
-                variant_filter_list[i - 1] if variant_filter_list else "",
-            )
-            records.append(rec)
-            if _record_result_for_rate_limit(rec.get("status") or "OK"):
-                print(f"\n  [限流] 连续 {RATE_LIMIT_CONSECUTIVE} 个 URL 失败，"
-                      f"判定为 Shein 限流，停止当前批次")
-                for j in range(i + 1, len(urls) + 1):
-                    records.append({
-                        "url": urls[j - 1],
-                        "status": "RATE_LIMITED",
-                        "seq_num": seq_list[j - 1] if seq_list else start_seq + (j - 1),
-                    })
-                _rate_limited = True
-                break
+
+        records, _rate_limited = _run_scrape_pool(
+            urls, seq_list, price_list, shipping_list, variant_filter_list,
+            start_seq, progress_cb=_progress,
+        )
 
     finally:
         if launched_new and chrome_proc is not None and not KEEP_CHROME_OPEN:
