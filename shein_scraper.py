@@ -1355,6 +1355,10 @@ def _format_stock_summary(sku_prices: list) -> str:
     格式：'<标签>: <数量>'，条目之间用 ' / ' 连接。标签是属性值按插入顺序
     用连字符拼起来（如 'Black-M'）；没有属性时退回 sku_code。数量为 0 → 缺货，
     1..LOW_STOCK_THRESHOLD → '少货 N'，更大 → 纯数字。
+
+    特例：**只有一个变体且它没有任何属性** → 只写数量，不写标签。这种商品的
+    sku_code 是 'I0xw62z3a2cr' 这类内部编码，对操作的人没有意义。变体多于一个
+    时即使都没属性也仍写 sku_code——否则两条 '20' 分不清谁是谁。
     """
     def _label(sp: dict) -> str:
         vals = [str(v).strip() for v in (sp.get("attrs") or {}).values() if v]
@@ -1373,7 +1377,13 @@ def _format_stock_summary(sku_prices: list) -> str:
             return f"少货 {stk}"
         return str(stk)
 
-    parts = [f"{_label(sp)}: {_count(sp)}" for sp in (sku_prices or [])]
+    sku_prices = sku_prices or []
+    if len(sku_prices) == 1:
+        only = sku_prices[0]
+        if not [v for v in (only.get("attrs") or {}).values() if v]:
+            return _count(only)
+
+    parts = [f"{_label(sp)}: {_count(sp)}" for sp in sku_prices]
     return " / ".join(parts)
 
 
