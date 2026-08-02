@@ -1,20 +1,27 @@
 """
-Excel-based pipeline: read pending URLs from .xlsx worksheets (one per store),
-scrape them, write results to Listing - completed 2nd/{store}/, and update
-Date + Status columns in the source Excel.
+Excel-based pipeline: 从中文表头模板读待处理 URL，抓取后把结果写回 F–M 列，
+并在 OUTPUT_ROOT/{sheet名}/ 下产出媒体文件夹和批次汇总 xlsx。
 
 Usage:
-    python run_excel.py                          # default: Shein Submited Links.xlsx
-    python run_excel.py "path/to/file.xlsx"      # specific file
+    python run_excel.py                          # 默认 SUBMITTED_DIR/INPUT_FILENAME
+    python run_excel.py "path/to/file.xlsx"      # 指定文件
 
-Columns (strict):
-    A: Seq       — sequence number (= output folder name). READ ONLY.
-    B: Website   — Shein product URL. READ ONLY.
-    C: Price     — manual product price (USD). READ ONLY. Overrides web sale_price.
-    D: Date      — filled after run: YYYY-MM-DD. WRITE.
-    E: Status    — filled after run: Done / Failed / Delisted. WRITE.
+Columns (strict, 中文表头模板):
+    A: 编号       — 序号，同时是输出子文件夹名。READ.
+    B: 链接       — Shein 商品 URL。READ.
+    C: 原价       — 手填售价 (USD)。READ. 空 → 用网页抓到的价。
+    D: 运费       — 手填运费 (USD)。READ. 空 → 用扫描推导的运费。
+    E: 变体       — 变体过滤声明。READ. 空 → 抓全部变体。
+    F: 日期       — 运行日期。WRITE.
+    G: 状态       — Done / Failed / Delisted。WRITE.
+    H: 图片       — 嵌入首张商品图。WRITE.
+    I: 希音价格   — 网页售价；多变体不同价时是 "9.99–14.99" 区间串。WRITE.
+    J: 希音标题   — 原始 h1 标题。WRITE.
+    K: eBay标题   — AI 生成（Haiku），失败回退规则。WRITE.
+    L: eBay价格   — (C或抓到价 + D或推导运费) × 1.4。WRITE.
+    M: 库存       — 单行变体库存摘要。WRITE.
 
-Only rows with BOTH Date and Status empty are processed.
+只处理「链接有值 且 日期/状态都为空」的行。B1 不是「链接」的 sheet 直接跳过。
 """
 
 import argparse
@@ -29,12 +36,104 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from shein_scraper import scrape_shein, RateLimitError
+from shein_scraper import scrape_shein, RateLimitError, _add_picture_to_cell
 from config import SUBMITTED_DIR, OUTPUT_ROOT_2ND as OUTPUT_ROOT, BACKUP_DIR, INPUT_FILENAME
 
 logger = logging.getLogger("run_excel")
 DEFAULT_XLSX = INPUT_FILENAME
 DEBUG_LOG_DIR = Path(__file__).resolve().parent / "debug_logs"
+
+# ── 中文表头模板 schema（A–M）────────────────────────────────────────────────
+# 见 docs/superpowers/specs/2026-08-02-us-template-parallel-design.md §1
+COL_SEQ, COL_URL, COL_PRICE, COL_SHIPPING, COL_VARIANT_FILTER = 1, 2, 3, 4, 5
+COL_DATE, COL_STATUS, COL_PICTURE = 6, 7, 8
+COL_WEB_PRICE, COL_SHEIN_TITLE = 9, 10
+COL_EBAY_TITLE, COL_EBAY_PRICE, COL_STOCK = 11, 12, 13
+
+EXPECTED_HEADERS = ["编号", "链接", "原价", "运费", "变体",
+                    "日期", "状态", "图片", "希音价格", "希音标题",
+                    "eBay标题", "eBay价格", "库存"]
+
+
+def _sheet_matches_template(ws) -> bool:
+    """只有 B1 == 「链接」的 sheet 才按新 schema 处理。"""
+    return str(ws.cell(1, COL_URL).value or "").strip() == "链接"
+
+
+def _read_pending_rows(ws) -> list[dict]:
+    """返回 [{row, seq, url, price, shipping, variant_filter}, ...]。
+
+    只挑「链接有值 且 日期/状态都为空」的行。非模板 sheet 返回 []。
+    原价/运费为空 → None（交给 scraper 回退）。编号或原价/运费非数字 → 跳过并记日志。
+    """
+    if not _sheet_matches_template(ws):
+        return []
+    pending = []
+    for r in range(2, ws.max_row + 1):
+        seq = ws.cell(r, COL_SEQ).value
+        url = ws.cell(r, COL_URL).value
+        if not url or ws.cell(r, COL_DATE).value or ws.cell(r, COL_STATUS).value:
+            continue
+        if seq is None:
+            logger.info("  row %d: skip (无编号)", r)
+            continue
+        try:
+            seq_int = int(seq)
+        except (TypeError, ValueError):
+            logger.info("  row %d: skip (编号 '%s' 非数字)", r, seq)
+            continue
+        raw_price = ws.cell(r, COL_PRICE).value
+        raw_ship = ws.cell(r, COL_SHIPPING).value
+        try:
+            price = float(raw_price) if raw_price not in (None, "") else None
+        except (TypeError, ValueError):
+            logger.info("  row %d: skip (原价 '%s' 非数字)", r, raw_price)
+            continue
+        try:
+            shipping = float(raw_ship) if raw_ship not in (None, "") else None
+        except (TypeError, ValueError):
+            logger.info("  row %d: skip (运费 '%s' 非数字)", r, raw_ship)
+            continue
+        pending.append({
+            "row": r,
+            "seq": seq_int,
+            "url": str(url).strip(),
+            "price": price,
+            "shipping": shipping,
+            "variant_filter": str(ws.cell(r, COL_VARIANT_FILTER).value or "").strip(),
+        })
+    return pending
+
+
+def _write_result_row(
+    ws, row: int, date: str, status: str,
+    picture_path=None,
+    web_price=None,
+    shein_title=None,
+    ebay_title=None,
+    ebay_price=None,
+    stock=None,
+) -> None:
+    """写结果列 F–M。日期(F) 和 状态(G) 总是写；其余为 None 就不写
+    （Failed / Delisted 的行只留日期和状态）。picture_path 是真实文件时
+    把图嵌进 H 并把行高撑到放得下。"""
+    ws.cell(row, COL_DATE).value = date
+    ws.cell(row, COL_STATUS).value = status
+    if picture_path and Path(picture_path).is_file():
+        row_h = _add_picture_to_cell(ws, row, COL_PICTURE, Path(picture_path))
+        if row_h:
+            existing = ws.row_dimensions[row].height or 0
+            ws.row_dimensions[row].height = max(existing, row_h)
+    if web_price is not None:
+        ws.cell(row, COL_WEB_PRICE).value = web_price
+    if shein_title is not None:
+        ws.cell(row, COL_SHEIN_TITLE).value = shein_title
+    if ebay_title is not None:
+        ws.cell(row, COL_EBAY_TITLE).value = ebay_title
+    if ebay_price is not None:
+        ws.cell(row, COL_EBAY_PRICE).value = ebay_price
+    if stock is not None:
+        ws.cell(row, COL_STOCK).value = stock
 
 
 def setup_logging():
