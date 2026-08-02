@@ -1,5 +1,14 @@
 # Shein Product Scraper - CHANGELOG
 
+## v3.8.0 — 2026-08-02
+- **新表格格式（中文表头 A–M）**: A 编号 / B 链接 / C 原价 / D 运费 / E 变体 由员工填；F 日期 / G 状态 / H 图片 / I 希音价格 / J 希音标题 / K eBay标题 / L eBay价格 / M 库存 由程序填。旧的英文输入格式（Seq/Website/Price/Date/Status）**已彻底移除**，B1 不是「链接」的 sheet 会被跳过。
+- **E 列变体声明**: 填 `黑色, 红色 / M, L` 只抓这些变体（`/` 分组、组内逗号分隔、忽略大小写和空格）。全都匹配不上 → 该行判 Failed。
+- **D 列手填运费**: 空则回退原来的满免/2.99 推导。eBay 价公式 = `(C原价 或 抓到价 + D运费 或 推导运费) × 1.4`。
+- **三标签并发**: `ThreadPoolExecutor(max_workers=3)`，图片下载池 8→4。限流触发时会先排空已完成的任务再停，不再整批丢结果。
+- **节奏**: 每个 URL 抓完之后随机 2–3 秒，删除了原来的 4–12 秒随机 + 每 18 个 30–90 秒长歇。
+- **$22 保底移除**: 低价商品不再被抬到 $30.80，`(原价+运费)×1.4` 直接算。
+- **`check_stock.py` 暂停**: 新模板上是安全 no-op（连 Chrome 都不启动），等 S 重跑日期 / T 更新价格 / U 更新库存 三列上线后再支持。
+
 ## v3.7.0 — 2026-05-20
 - **Excel C 列新增 "Price"，手动售价覆盖网页爬到的 sale_price**: 输入 Excel 列右移一位 (A=Seq, B=Website, C=Price 新, D=Date, E=Status, F=Stock, G=Last Checked)。C 列填了价就以 C 为准，否则回退到网页价。
 - **价格一致性**: 不只主商品 price，每个 sku_prices 变体的 sale_price 也同步覆盖，"各变体价格"段、变体子行、Variation 2 单元格全部使用 C 列价格，避免"主行 eBay $37.11 / 变体 eBay $30.80"这种 confusing 输出。

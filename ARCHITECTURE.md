@@ -54,28 +54,41 @@ Plus a lightweight **Stock Checker** for monitoring inventory.
 
 ## Input Excel Format
 
-File: any `.xlsx` in `submitted/` folder (e.g. `Shein Submited Links Test.xlsx`)
+File: `SHEIN_SUBMITTED_DIR / SHEIN_INPUT_FILENAME`
+(e.g. `D:\共享云端硬盘\02 希音\01 店铺资料\99 ZR\美国希音链接汇总 - ZR.xlsx`)
 
-Each **worksheet = one store** (e.g. `B4`, `L8`, `Test1`)
+Each **worksheet = one store** (e.g. `ZR1`, `ZR2`) — also the output subfolder name.
+
+Chinese-header template, columns A–M. **A–E the operator fills, F–M the scripts fill.**
 
 | Col | Header | Read/Write | Description |
 |-----|--------|------------|-------------|
-| A | Seq | **Read only** | Sequence number = output folder name |
-| B | Website | **Read only** | Shein product URL |
-| C | Price | **Read only** | Manual product price (USD) — overrides web sale_price |
-| D | Date | **Write** | Execution date (YYYY-MM-DD) |
-| E | Status | **Write** | Done / Failed / Delisted |
-| F | Stock | **Write** | In Stock (N) / Low Stock (N) / Sold Out / Delisted |
-| G | Last Checked | **Write** | Stock check date (YYYY-MM-DD) |
+| A | 编号 | **Read** | Sequence number = output folder name |
+| B | 链接 | **Read** | Shein product URL |
+| C | 原价 | **Read** | Manual sale price (USD). Blank → scraped price |
+| D | 运费 | **Read** | Manual shipping (USD). Blank → derived (free-threshold → $0, else $2.99) |
+| E | 变体 | **Read** | Variant declaration, e.g. `Black, Red / M, L`. Blank → scrape all |
+| F | 日期 | **Write** | Execution date (YYYY-MM-DD) |
+| G | 状态 | **Write** | Done / Failed / Delisted |
+| H | 图片 | **Write** | First product image, embedded |
+| I | 希音价格 | **Write** | Scraped price; a `9.99–14.99` range string when variants differ |
+| J | 希音标题 | **Write** | Raw scraped h1 title |
+| K | eBay标题 | **Write** | AI-generated (Haiku), rule fallback |
+| L | eBay价格 | **Write** | `(C or scraped + D or derived) × 1.4` |
+| M | 库存 | **Write** | One-line variant stock summary |
 
 **Rules:**
-- `run_excel.py` processes rows where **Date AND Status are both empty**
-- `check_stock.py` processes rows where **Status == "Done"**
-- Columns A, B, C are **never modified** by any script
-- Column C (Price), if filled, replaces the web-scraped sale price for that row. The
-  eBay listing price formula stays `(price + shipping) × 1.4`, but `price`
-  comes from column C instead of the web. If column C is empty, the scraper falls
-  back to the web sale price.
+- `run_excel.py` processes rows where **链接 is filled AND 日期/状态 are both empty**
+- Sheets whose `B1` is not `链接` are skipped with a warning — the old English
+  schema (`Seq/Website/Price/Date/Status`) was **removed in v3.8.0**
+- Columns A–E are **never modified** by any script
+- Column C, if filled, replaces the web-scraped sale price for that row — and is
+  propagated to every `sku_prices` variant so the batch xlsx and the per-SKU txt
+  agree with the main row. Column D likewise overrides the derived shipping.
+- Column E, if filled and **nothing** matches, the row is marked `Failed`
+  (`variant_filter_no_match`) rather than written half-scraped
+- `check_stock.py` is a **no-op on this template** (its Stock / Last Checked columns
+  no longer exist). Re-check support returns once the S/T/U columns land.
 
 ---
 
@@ -146,12 +159,13 @@ After scrape:
 |----------|-------|---------|
 | `CDP_PORT` | 9222 | Chrome DevTools Protocol port |
 | `PAGE_LOAD_MAX_WAIT` | 20s | Max wait for goods_sn |
-| `DELAY_BETWEEN_PAGES` | 2s | Cooldown between URLs |
+| `INTER_URL_PAUSE_MIN` / `MAX` | 2.0s / 3.0s | Random pause each worker takes after finishing a URL. No long pauses. |
 | `EXTRACTION_TIMEOUT_SEC` | 60s | Hard timeout per URL |
 | `CAPTCHA_AI_MAX_ATTEMPTS` | 3 | AI captcha solve attempts |
 | `RATE_LIMIT_CONSECUTIVE` | 3 | Consecutive fails = rate limit |
-| `IMAGE_DOWNLOAD_WORKERS` | 8 | Parallel download threads |
-| `EBAY_MARKUP` | 1.4 | eBay price multiplier |
+| `MAX_PARALLEL_TABS` | 3 | Concurrent CDP tabs scraping |
+| `IMAGE_DOWNLOAD_WORKERS` | 4 | Parallel download threads (3 products × 4 = 12 sockets) |
+| `EBAY_MARKUP` | 1.4 | eBay price multiplier — no minimum-subtotal floor |
 
 ---
 
