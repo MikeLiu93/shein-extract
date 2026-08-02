@@ -26,6 +26,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from config import SUBMITTED_DIR, BACKUP_DIR, INPUT_FILENAME
+from run_excel import _sheet_matches_template
 
 logger = logging.getLogger("check_stock")
 DEFAULT_XLSX = INPUT_FILENAME
@@ -123,6 +124,16 @@ def check_stock_excel(xlsx_path: Path) -> None:
     logger.info("Opening: %s", xlsx_path.name)
     wb = load_workbook(xlsx_path)
 
+    # 中文新模板（A–M）里 E/F/G 是 变体/日期/状态，老的库存复查逻辑会写坏表。
+    # 整份文件都是新模板 → 直接返回，连 Chrome 都不用起。
+    # 等 S 重跑日期 / T 更新价格 / U 更新库存 三列定型后再支持。
+    # 见 docs/superpowers/specs/2026-08-02-us-template-parallel-design.md §6
+    if wb.sheetnames and all(_sheet_matches_template(wb[n]) for n in wb.sheetnames):
+        logger.warning("%s: 全部是中文新模板，库存复查暂不支持（等 S/T/U 列上线），跳过",
+                       xlsx_path.name)
+        wb.close()
+        return
+
     # Ensure Chrome is running once for the whole file (not per-sheet)
     _ensure_chrome(CDP_PORT)
     today = datetime.now().strftime("%Y-%m-%d")
@@ -131,6 +142,10 @@ def check_stock_excel(xlsx_path: Path) -> None:
         ws = wb[ws_name]
         store = ws_name.strip()
         logger.info("Sheet: %s", store)
+
+        if _sheet_matches_template(ws):
+            logger.warning("  Sheet '%s': 中文新模板，库存复查暂不支持，跳过", store)
+            continue
 
         # Ensure headers in columns 6 (Stock) and 7 (Last Checked)
         if ws.cell(1, 6).value != "Stock":
