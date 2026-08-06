@@ -39,21 +39,20 @@ CHROME_CANDIDATES = [
     os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
 ]
 
-DRIVE_LETTERS = list("DEFGHIJK")
-SHARED_FOLDER_NAME = "共享云端硬盘"
-PIPELINE_SUBPATH = Path("02 希音") / "Auto Pipeline"
-SUBMITTED_SUBPATH = "Listing - web links (submitted)"
-OUTPUT_SUBPATH = "Listing - completed 2nd"
+# v3.8.1: 盘符扫描已移除。以前会扫 D~K 找「共享云端硬盘\02 希音\Auto Pipeline」
+# 来自动填路径，但那个目录结构已经不用了，扫描只会永远失败。改成员工自己选文件夹。
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def is_first_run_complete() -> bool:
-    if not CONFIG_FILE.exists():
+def is_first_run_complete(path: "Path | None" = None) -> bool:
+    """配置是否已经填过。`path` 只给测试用，默认读 %APPDATA% 下那份。"""
+    cfg = Path(path) if path is not None else CONFIG_FILE
+    if not cfg.exists():
         return False
     try:
-        text = CONFIG_FILE.read_text(encoding="utf-8")
+        text = cfg.read_text(encoding="utf-8")
     except Exception:
         return False
     required = ["SHEIN_SUBMITTED_DIR", "SHEIN_OUTPUT_DIR", "SHEIN_BACKUP_DIR"]
@@ -64,15 +63,6 @@ def find_chrome() -> str | None:
     for p in CHROME_CANDIDATES:
         if Path(p).exists():
             return p
-    return None
-
-
-def detect_drive_with_shared() -> str | None:
-    """Scan likely drive letters for {letter}:\\共享云端硬盘\\02 希音\\Auto Pipeline"""
-    for letter in DRIVE_LETTERS:
-        candidate = Path(f"{letter}:\\") / SHARED_FOLDER_NAME / PIPELINE_SUBPATH
-        if candidate.exists():
-            return f"{letter}:"
     return None
 
 
@@ -115,7 +105,6 @@ class Wizard:
             "backup_dir": "",
         }
         self.chrome_path = None
-        self.detected_drive = None
 
         # If config.env already exists (re-run via --config), pre-fill the
         # entries with the saved values so the user edits in place.
@@ -220,27 +209,15 @@ class Wizard:
         self._heading("系统检查")
 
         self.chrome_path = find_chrome()
-        self.detected_drive = detect_drive_with_shared()
 
         chrome_msg = (
             f"✓ 找到 Chrome：{self.chrome_path}"
             if self.chrome_path
             else "✗ 未找到 Chrome —— 请先安装 https://www.google.com/chrome/ 后重新打开向导。"
         )
-        drive_msg = (
-            f"✓ 检测到共享云端硬盘在 {self.detected_drive}"
-            if self.detected_drive
-            else "✗ 未在 D~K 盘下找到「共享云端硬盘\\02 希音\\Auto Pipeline」。"
-            "\n  请确认 Google Drive for Desktop 已安装并完成同步，或下一步手动指定路径。"
-        )
-
         ttk.Label(self.frame, text=chrome_msg, wraplength=620,
                   justify="left", font=("Microsoft YaHei", 10),
                   foreground="green" if self.chrome_path else "red").pack(
-            anchor="w", pady=4)
-        ttk.Label(self.frame, text=drive_msg, wraplength=620,
-                  justify="left", font=("Microsoft YaHei", 10),
-                  foreground="green" if self.detected_drive else "orange").pack(
             anchor="w", pady=4)
 
         if not self.chrome_path:
@@ -248,29 +225,20 @@ class Wizard:
             self._nav_buttons(on_next=None, show_back=True)
             return
 
-        if not self.detected_drive:
-            self._para(
-                "\n如果你确定 Drive 还在装/同步中，可以选择跳过 —— 下一步手动填路径，"
-                "等 Drive 就绪后工具自然能跑通。\n"
-            )
         self._nav_buttons(on_next=self._next)
 
     # ── Step 3: Path config ──
     def _step_paths(self):
         self._heading("路径设置")
         self._para(
-            "确认或修改以下 4 个路径。如果系统检查时找到了共享盘，路径已自动填写。"
+            "点【浏览...】选择文件夹，或直接把路径粘进去。\n"
+            "输出根目录留空 = 和输入文件夹相同（店铺名会自动作为子文件夹）。"
         )
-
-        if self.detected_drive and not self.values["submitted_dir"]:
-            base = Path(f"{self.detected_drive}\\") / SHARED_FOLDER_NAME / PIPELINE_SUBPATH
-            self.values["submitted_dir"] = str(base / SUBMITTED_SUBPATH)
-            self.values["output_dir"] = str(base / OUTPUT_SUBPATH)
 
         rows = [
             ("输入 Excel 文件夹", "submitted_dir", True),
             ("输入 Excel 文件名", "input_filename", False),
-            ("输出根目录", "output_dir", True),
+            ("输出根目录（留空 = 同输入文件夹）", "output_dir", True),
             ("备份目录（建议独立的备份共享盘）", "backup_dir", True),
         ]
         self._entries = {}
@@ -291,11 +259,19 @@ class Wizard:
         def on_next():
             for k, var in self._entries.items():
                 self.values[k] = var.get().strip()
-            # Validate
+            # 校验：只提醒，不挡路。共享盘可能还在同步、文件夹可能等下才建，
+            # 挡住员工没意义 —— 真跑的时候找不到会明确报错。
+            if not self.values["submitted_dir"]:
+                messagebox.showerror("配置缺失", "请填写「输入 Excel 文件夹」。")
+                return
             sd = Path(self.values["submitted_dir"])
             if not sd.is_dir():
-                messagebox.showerror("路径错误", f"输入文件夹不存在:\n{sd}")
-                return
+                if not messagebox.askyesno(
+                    "文件夹不存在",
+                    f"输入文件夹现在不存在:\n{sd}\n\n是否仍然继续？"
+                    "（共享盘还在同步的话可以先存，跑之前会用到）",
+                ):
+                    return
             xlsx = sd / self.values["input_filename"]
             if not xlsx.is_file():
                 if not messagebox.askyesno(
@@ -304,16 +280,18 @@ class Wizard:
                     "（员工首次跑之前可以再放进去）",
                 ):
                     return
+            # 输出根目录留空 → 跟输入文件夹同目录；店铺名（sheet 名）会作为子文件夹
+            if not self.values["output_dir"]:
+                self.values["output_dir"] = str(sd)
             od = Path(self.values["output_dir"])
-            if not od.parent.is_dir():
-                messagebox.showerror("路径错误",
-                                     f"输出根目录的父目录不存在:\n{od.parent}")
-                return
             try:
                 od.mkdir(parents=True, exist_ok=True)
             except Exception as e:
-                messagebox.showerror("无法创建", f"输出目录创建失败: {e}")
-                return
+                if not messagebox.askyesno(
+                    "无法创建输出目录",
+                    f"输出目录创建失败:\n{e}\n\n仍然继续？（运行时再创建）",
+                ):
+                    return
             bd = Path(self.values["backup_dir"])
             if not bd.parent.is_dir():
                 if not messagebox.askyesno(
