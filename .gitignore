@@ -52,3 +52,4 @@ key_store.py
 .git/**/*.dead.*
 COMMIT_MSG_*.txt
 test_can_create.txt
+例子/

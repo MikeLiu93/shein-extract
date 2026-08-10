@@ -94,13 +94,14 @@ def backup_excel(xlsx_path: Path) -> None:
 
 
 def safe_save(wb, xlsx_path: Path) -> None:
-    """Save workbook. If locked, save as copy with '2' suffix."""
+    """原子保存。被锁住时退回 '2' 后缀的副本。见 save_workbook_atomic 的说明。"""
+    from shein_scraper import save_workbook_atomic
     try:
-        wb.save(xlsx_path)
+        save_workbook_atomic(wb, xlsx_path)
     except PermissionError:
         alt = xlsx_path.with_stem(xlsx_path.stem + "2")
         logger.warning("Cannot save to %s (locked), saving to %s", xlsx_path.name, alt.name)
-        wb.save(alt)
+        save_workbook_atomic(wb, alt)
 
 
 def _stock_label(total_stock: int | None) -> str:
