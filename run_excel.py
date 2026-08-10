@@ -1,20 +1,27 @@
 """
-Excel-based pipeline: read pending URLs from .xlsx worksheets (one per store),
-scrape them, write results to Listing - completed 2nd/{store}/, and update
-Date + Status columns in the source Excel.
+Excel-based pipeline: 从中文表头模板读待处理 URL，抓取后把结果写回 F–M 列，
+并在 OUTPUT_ROOT/{sheet名}/ 下产出媒体文件夹和批次汇总 xlsx。
 
 Usage:
-    python run_excel.py                          # default: Shein Submited Links.xlsx
-    python run_excel.py "path/to/file.xlsx"      # specific file
+    python run_excel.py                          # 默认 SUBMITTED_DIR/INPUT_FILENAME
+    python run_excel.py "path/to/file.xlsx"      # 指定文件
 
-Columns (strict):
-    A: Seq       — sequence number (= output folder name). READ ONLY.
-    B: Website   — Shein product URL. READ ONLY.
-    C: Price     — manual product price (USD). READ ONLY. Overrides web sale_price.
-    D: Date      — filled after run: YYYY-MM-DD. WRITE.
-    E: Status    — filled after run: Done / Failed / Delisted. WRITE.
+Columns (strict, 中文表头模板):
+    A: 编号       — 序号，同时是输出子文件夹名。READ.
+    B: 链接       — Shein 商品 URL。READ.
+    C: 原价       — 手填售价 (USD)。READ. 空 → 用网页抓到的价。
+    D: 运费       — 手填运费 (USD)。READ. 空 → 用扫描推导的运费。
+    E: 变体       — 变体过滤声明。READ. 空 → 抓全部变体。
+    F: 日期       — 运行日期。WRITE.
+    G: 状态       — Done / Failed / Delisted。WRITE.
+    H: 图片       — 嵌入首张商品图。WRITE.
+    I: 希音价格   — 网页售价；多变体不同价时是 "9.99–14.99" 区间串。WRITE.
+    J: 希音标题   — 原始 h1 标题。WRITE.
+    K: eBay标题   — AI 生成（Haiku），失败回退规则。WRITE.
+    L: eBay价格   — (C或抓到价 + D或推导运费) × 1.4。WRITE.
+    M: 库存       — 单行变体库存摘要。WRITE.
 
-Only rows with BOTH Date and Status empty are processed.
+只处理「链接有值 且 日期/状态都为空」的行。B1 不是「链接」的 sheet 直接跳过。
 """
 
 import argparse
@@ -29,12 +36,105 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from shein_scraper import scrape_shein, RateLimitError
+from shein_scraper import (scrape_shein, RateLimitError, _add_picture_to_cell,
+                           save_workbook_atomic)
 from config import SUBMITTED_DIR, OUTPUT_ROOT_2ND as OUTPUT_ROOT, BACKUP_DIR, INPUT_FILENAME
 
 logger = logging.getLogger("run_excel")
 DEFAULT_XLSX = INPUT_FILENAME
 DEBUG_LOG_DIR = Path(__file__).resolve().parent / "debug_logs"
+
+# ── 中文表头模板 schema（A–M）────────────────────────────────────────────────
+# 见 docs/superpowers/specs/2026-08-02-us-template-parallel-design.md §1
+COL_SEQ, COL_URL, COL_PRICE, COL_SHIPPING, COL_VARIANT_FILTER = 1, 2, 3, 4, 5
+COL_DATE, COL_STATUS, COL_PICTURE = 6, 7, 8
+COL_WEB_PRICE, COL_SHEIN_TITLE = 9, 10
+COL_EBAY_TITLE, COL_EBAY_PRICE, COL_STOCK = 11, 12, 13
+
+EXPECTED_HEADERS = ["编号", "链接", "原价", "运费", "变体",
+                    "日期", "状态", "图片", "希音价格", "希音标题",
+                    "eBay标题", "eBay价格", "库存"]
+
+
+def _sheet_matches_template(ws) -> bool:
+    """只有 B1 == 「链接」的 sheet 才按新 schema 处理。"""
+    return str(ws.cell(1, COL_URL).value or "").strip() == "链接"
+
+
+def _read_pending_rows(ws) -> list[dict]:
+    """返回 [{row, seq, url, price, shipping, variant_filter}, ...]。
+
+    只挑「链接有值 且 日期/状态都为空」的行。非模板 sheet 返回 []。
+    原价/运费为空 → None（交给 scraper 回退）。编号或原价/运费非数字 → 跳过并记日志。
+    """
+    if not _sheet_matches_template(ws):
+        return []
+    pending = []
+    for r in range(2, ws.max_row + 1):
+        seq = ws.cell(r, COL_SEQ).value
+        url = ws.cell(r, COL_URL).value
+        if not url or ws.cell(r, COL_DATE).value or ws.cell(r, COL_STATUS).value:
+            continue
+        if seq is None:
+            logger.info("  row %d: skip (无编号)", r)
+            continue
+        try:
+            seq_int = int(seq)
+        except (TypeError, ValueError):
+            logger.info("  row %d: skip (编号 '%s' 非数字)", r, seq)
+            continue
+        raw_price = ws.cell(r, COL_PRICE).value
+        raw_ship = ws.cell(r, COL_SHIPPING).value
+        try:
+            price = float(raw_price) if raw_price not in (None, "") else None
+        except (TypeError, ValueError):
+            logger.info("  row %d: skip (原价 '%s' 非数字)", r, raw_price)
+            continue
+        try:
+            shipping = float(raw_ship) if raw_ship not in (None, "") else None
+        except (TypeError, ValueError):
+            logger.info("  row %d: skip (运费 '%s' 非数字)", r, raw_ship)
+            continue
+        pending.append({
+            "row": r,
+            "seq": seq_int,
+            "url": str(url).strip(),
+            "price": price,
+            "shipping": shipping,
+            "variant_filter": str(ws.cell(r, COL_VARIANT_FILTER).value or "").strip(),
+        })
+    return pending
+
+
+def _write_result_row(
+    ws, row: int, date: str, status: str,
+    picture_path=None,
+    web_price=None,
+    shein_title=None,
+    ebay_title=None,
+    ebay_price=None,
+    stock=None,
+) -> None:
+    """写结果列 F–M。日期(F) 和 状态(G) 总是写；其余为 None 就不写
+    （Failed / Delisted 的行只留日期和状态）。picture_path 是真实文件时
+    把图嵌进 H 并把行高撑到放得下。"""
+    ws.cell(row, COL_DATE).value = date
+    ws.cell(row, COL_STATUS).value = status
+    if picture_path and Path(picture_path).is_file():
+        row_h = _add_picture_to_cell(ws, row, COL_PICTURE, Path(picture_path))
+        if row_h:
+            existing = ws.row_dimensions[row].height or 0
+            ws.row_dimensions[row].height = max(existing, row_h)
+    if web_price is not None:
+        ws.cell(row, COL_WEB_PRICE).value = web_price
+    if shein_title is not None:
+        ws.cell(row, COL_SHEIN_TITLE).value = shein_title
+    if ebay_title is not None:
+        ws.cell(row, COL_EBAY_TITLE).value = ebay_title
+    if ebay_price is not None:
+        ws.cell(row, COL_EBAY_PRICE).value = ebay_price
+    if stock is not None:
+        ws.cell(row, COL_STOCK).value = stock
 
 
 def setup_logging():
@@ -76,72 +176,54 @@ def backup_excel(xlsx_path: Path) -> None:
 
 
 def safe_save(wb, xlsx_path: Path) -> None:
-    """Save workbook. If locked by another user, save as copy with '2' suffix."""
+    """原子保存。被别人锁住（Excel 开着）时退回 '2' 后缀的副本。
+
+    走 save_workbook_atomic：先写同目录的临时文件、自检完整性，再原子替换。
+    保存中途失败时目标文件一个字节都不会变 —— 以前是直接 wb.save(目标)，
+    写到一半炸掉就会留下没有 [Content_Types].xml 的半截文件。
+    """
     try:
-        wb.save(xlsx_path)
+        save_workbook_atomic(wb, xlsx_path)
     except PermissionError:
         alt = xlsx_path.with_stem(xlsx_path.stem + "2")
         logger.warning("Cannot save to %s (locked), saving to %s", xlsx_path.name, alt.name)
-        wb.save(alt)
+        save_workbook_atomic(wb, alt)
         logger.info("Saved to alternate: %s", alt.name)
 
 
 def process_excel(xlsx_path: Path) -> None:
-    """Process all worksheets in an Excel file."""
+    """按中文表头模板处理 `xlsx_path` 里的每个 sheet。非模板 sheet 跳过。
+    列定义见模块 docstring 和 design spec §1。"""
     logger.info("Opening: %s", xlsx_path.name)
     wb = load_workbook(xlsx_path)
 
     for ws_name in wb.sheetnames:
         ws = wb[ws_name]
         store = ws_name.strip()
-        logger.info("Sheet: %s", store)
-
-        # Normalize headers: col C = Price, col D = Date
-        if str(ws.cell(1, 3).value or "").strip() == "":
-            ws.cell(1, 3).value = "Price"
-        header_d = str(ws.cell(1, 4).value or "").strip()
-        if header_d in ("Execute Date", ""):
-            ws.cell(1, 4).value = "Date"
-
-        # Collect pending rows (Date AND Status both empty)
-        pending = []
-        for row in range(2, ws.max_row + 1):
-            seq = ws.cell(row, 1).value
-            url = ws.cell(row, 2).value
-            price_val = ws.cell(row, 3).value
-            date_val = ws.cell(row, 4).value
-            status_val = ws.cell(row, 5).value
-            if url and seq is not None and not date_val and not status_val:
-                try:
-                    price_f = float(price_val) if price_val not in (None, "") else None
-                except (TypeError, ValueError):
-                    price_f = None
-                pending.append((row, int(seq), str(url).strip(), price_f))
-
-        if not pending:
-            logger.info("  No pending rows in '%s'", store)
+        if not _sheet_matches_template(ws):
+            logger.warning("  Sheet '%s': 不是中文模板（B1 不是「链接」），跳过", store)
             continue
 
-        logger.info("  %d pending URL(s): seq %s",
-                     len(pending), [p[1] for p in pending])
+        pending = _read_pending_rows(ws)
+        if not pending:
+            logger.info("  Sheet '%s': 没有待处理的行", store)
+            continue
 
-        # Prepare output folder
+        logger.info("  Sheet '%s': %d 行待处理: seq %s",
+                    store, len(pending), [p["seq"] for p in pending])
+
         store_dir = OUTPUT_ROOT / store
         store_dir.mkdir(parents=True, exist_ok=True)
 
-        # Run scraper
-        urls = [p[2] for p in pending]
-        seqs = [p[1] for p in pending]
-        prices = [p[3] for p in pending]
         today = datetime.now().strftime("%Y-%m-%d")
+        seqs = [p["seq"] for p in pending]
         seq_min, seq_max = min(seqs), max(seqs)
-        xlsx_name = f"{store}-{seq_min}-{seq_max}-{today.replace('-', '')}.xlsx"
+        batch_xlsx = f"{store}-{seq_min}-{seq_max}-{today.replace('-', '')}.xlsx"
 
-        # screenshots/ subfolder is created lazily by the scraper itself
         old_cwd = Path.cwd()
         results = None
         try:
-            # Google Drive sync may briefly lock new folders
+            # Google Drive 同步偶尔会短暂锁住新建目录
             for _retry in range(5):
                 try:
                     os.chdir(store_dir)
@@ -149,10 +231,16 @@ def process_excel(xlsx_path: Path) -> None:
                 except PermissionError:
                     time.sleep(2)
             else:
-                os.chdir(store_dir)  # final attempt, let it raise
-            logger.info("  Scraping %d URLs → %s/%s", len(urls), store, xlsx_name)
-            results = scrape_shein(urls, output=xlsx_name, seq_list=seqs,
-                                   price_list=prices)
+                os.chdir(store_dir)   # 最后一次，让它抛
+            logger.info("  Scraping %d URLs → %s/%s", len(pending), store, batch_xlsx)
+            results = scrape_shein(
+                [p["url"] for p in pending],
+                output=batch_xlsx,
+                seq_list=seqs,
+                price_list=[p["price"] for p in pending],
+                shipping_list=[p["shipping"] for p in pending],
+                variant_filter_list=[p["variant_filter"] for p in pending],
+            )
         except RateLimitError:
             logger.warning("  [限流] Rate limited during '%s'", store)
         except Exception as e:
@@ -165,45 +253,48 @@ def process_excel(xlsx_path: Path) -> None:
         finally:
             os.chdir(old_cwd)
 
-        # Update Date + Status based on results
-        for row_idx, seq, url, _price in pending:
+        # 把结果扇回模板行
+        for p in pending:
+            row, seq = p["row"], p["seq"]
             seq_folder = store_dir / str(seq)
             has_files = seq_folder.is_dir() and any(seq_folder.iterdir())
 
-            # Determine status from result record
             rec = None
             if results:
                 rec = next((r for r in results if r.get("seq_num") == seq), None)
 
-            # A record with empty SKU or [goods_name] title is not a real success
+            # SKU 为空或标题里还带 [goods_name] 的，不算真成功
             is_bad_data = (rec and rec.get("status") == "OK"
                            and (not rec.get("sku")
                                 or "[goods_name]" in (rec.get("title") or "")))
 
-            if has_files and not is_bad_data:
-                ws.cell(row_idx, 4).value = today
-                ws.cell(row_idx, 5).value = "Done"
+            if rec and has_files and not is_bad_data and rec.get("status") == "OK":
+                _write_result_row(
+                    ws, row=row, date=today, status="Done",
+                    picture_path=rec.get("first_image_path") or None,
+                    web_price=rec.get("web_price_display"),
+                    shein_title=rec.get("original_title") or rec.get("title"),
+                    ebay_title=rec.get("ebay_title"),
+                    ebay_price=rec.get("ebay_price"),
+                    stock=rec.get("stock_summary"),
+                )
                 logger.info("    seq %d → Done", seq)
             elif rec and rec.get("status") == "DELISTED":
-                ws.cell(row_idx, 4).value = today
-                ws.cell(row_idx, 5).value = "Delisted"
+                _write_result_row(ws, row=row, date=today, status="Delisted")
                 logger.info("    seq %d → Delisted", seq)
             else:
                 detail = rec.get("status", "") if rec else ""
                 if is_bad_data:
                     detail = "no data loaded"
-                ws.cell(row_idx, 4).value = today
-                ws.cell(row_idx, 5).value = "Failed"
+                _write_result_row(ws, row=row, date=today, status="Failed")
                 logger.info("    seq %d → Failed %s", seq,
                             f"({detail})" if detail else "")
 
-        # Save after each store (so progress isn't lost)
         safe_save(wb, xlsx_path)
         logger.info("  Saved progress to %s", xlsx_path.name)
 
     wb.close()
     logger.info("Done: %s", xlsx_path.name)
-
 
 def main():
     parser = argparse.ArgumentParser(
