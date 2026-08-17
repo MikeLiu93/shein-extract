@@ -81,27 +81,41 @@ def setup_logging():
 
 
 def backup_excel(xlsx_path: Path) -> None:
-    """Backup Excel to personal Drive before reading."""
+    """备份输入表。备份目录建不出来时退回输入文件所在目录；**绝不抛异常**
+    —— 备份不该成为开跑的前提条件（见 run_excel.backup_excel）。"""
     import shutil
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y%m%d")
-    dest = BACKUP_DIR / f"{xlsx_path.stem}_{today}.xlsx"
-    try:
-        shutil.copy2(xlsx_path, dest)
-        logger.info("Backup: %s → %s", xlsx_path.name, dest)
-    except Exception as e:
-        logger.warning("Backup failed (continuing): %s", e)
+    backup_name = f"{xlsx_path.stem}_{today}.xlsx"
+    tried = []
+    for dest_dir in (BACKUP_DIR, xlsx_path.parent):
+        if dest_dir in tried:
+            continue
+        tried.append(dest_dir)
+        try:
+            dest = dest_dir / backup_name
+            if dest.resolve() == xlsx_path.resolve():
+                continue
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(xlsx_path, dest)
+            logger.info("Backup: %s → %s", xlsx_path.name, dest)
+            return
+        except Exception as e:
+            logger.warning("Backup to %s failed: %s", dest_dir, e)
+    logger.warning("Backup skipped (continuing)")
 
 
 def safe_save(wb, xlsx_path: Path) -> None:
-    """原子保存。被锁住时退回 '2' 后缀的副本。见 save_workbook_atomic 的说明。"""
+    """原子保存。存不进去时退回 '2' 后缀的副本。见 save_workbook_atomic 的说明。"""
     from shein_scraper import save_workbook_atomic
     try:
         save_workbook_atomic(wb, xlsx_path)
-    except PermissionError:
+        return
+    except Exception as e:
         alt = xlsx_path.with_stem(xlsx_path.stem + "2")
-        logger.warning("Cannot save to %s (locked), saving to %s", xlsx_path.name, alt.name)
-        save_workbook_atomic(wb, alt)
+        logger.warning("Cannot save to %s (%s: %s), trying %s",
+                       xlsx_path.name, type(e).__name__, e, alt.name)
+    save_workbook_atomic(wb, alt)
+    logger.warning("Saved to alternate: %s", alt.name)
 
 
 def _stock_label(total_stock: int | None) -> str:

@@ -55,7 +55,7 @@ from urllib.parse import parse_qs, urlencode, urlparse, unquote, urlunparse
 import requests
 import websocket
 from datetime import date
-from notify import alert_captcha, alert_signin, alert_generic
+from notify import alert_signin, alert_generic
 from openpyxl import Workbook
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
@@ -82,8 +82,19 @@ OOPS_RETRY_BACKOFF_MIN = 30
 OOPS_RETRY_BACKOFF_MAX = 60
 EXTRACTION_TIMEOUT_SEC = 60       # 单个页面提取超时（秒），正常3-5s加载，超过60s视为失败
 RATE_LIMIT_CONSECUTIVE  = 3       # 连续失败 N 次视为限流，停止当前批次
+# 人机验证：不截图、不发通知，就在 Chrome 窗口里等人工过。等满 CAPTCHA_WAIT_SEC
+# 还没人处理就整轮收工（剩下的 URL 不动，下次重跑接着来）。
+CAPTCHA_WAIT_SEC       = 600      # 等人工通过验证码的上限（秒）= 10 分钟
+CAPTCHA_POLL_SEC       = 15       # 每隔多少秒回头看一眼验证码过没过
 MAX_PARALLEL_TABS      = 3        # 同时打开多少个 CDP tab 抓取（保守）
 PICTURE_MAX_HEIGHT_PX  = 168
+# 嵌进 Excel 的图只是缩略图（显示高度 ≤ PICTURE_MAX_HEIGHT_PX），没必要存原图。
+# 以前存的是整张原图的 PNG（一张 0.7–2MB），99 张就把总表撑到 57MB —— Web 版
+# Excel 直接打不开，Google Drive 上保存也开始不稳。现在按显示尺寸的
+# PICTURE_SUPERSAMPLE 倍重采样后存 JPEG，一张 20–30KB。
+PICTURE_SUPERSAMPLE    = 2        # 存 2 倍于显示尺寸的像素，高分屏下才不糊
+PICTURE_JPEG_QUALITY   = 80
+PICTURE_MAX_BYTES      = 60_000   # 超过这个大小的旧图，保存时顺手重新压一遍
 KEEP_CHROME_OPEN       = True
 PERSISTENT_PROFILE_DIR = os.path.join(os.path.expanduser("~"), "shein-cdp-profile")
 OUTPUT_ENCODING        = "utf-8"
@@ -112,8 +123,30 @@ _CHROME_PATHS = [
 
 
 class RateLimitError(Exception):
-    """连续多个 URL 失败，判定为 Shein 限流。"""
-    pass
+    """连续多个 URL 失败，判定为 Shein 限流。
+
+    `records` 带着已经抓到的那部分结果 —— 调用方得拿它把成功的行写回表里，
+    否则一整批抓好的商品会跟着异常一起丢掉。
+    """
+
+    def __init__(self, message, records=None):
+        super().__init__(message)
+        self.records = records or []
+
+
+class CaptchaAbort(Exception):
+    """人机验证等满 10 分钟没人处理，本轮提前收工。
+
+    `records` 同 RateLimitError：已经抓到的部分照常写回表。
+    """
+
+    def __init__(self, message, records=None):
+        super().__init__(message)
+        self.records = records or []
+
+
+# 任一 worker 等验证码超时就置上：其余 worker 立刻停手，池子不再派新活。
+_captcha_abort = threading.Event()
 
 
 _rate_limit_lock  = threading.Lock()
@@ -1135,12 +1168,12 @@ def _screenshots_dir(base_dir) -> Path:
     return d
 
 
-def _check_and_handle_block(port, tab_id, url, base_dir, max_wait=300):
+def _check_and_handle_block(port, tab_id, url, base_dir, max_wait=CAPTCHA_WAIT_SEC):
     """
     检测登录弹窗/验证码拦截。
-    - 登录弹窗：自动尝试关闭
-    - 验证码：立即截图 + 发邮件通知，等待人工解决（不再自动绕过）
-    - 超时未解决：返回 False
+    - 登录弹窗：自动尝试关闭，失败才截图 + 通知
+    - 人机验证：不截图、不通知，安静地等人工在 Chrome 窗口里过（最多 max_wait）
+    - 等满还没人处理：置上 _captcha_abort，整轮收工
     返回 True 表示已解决或无拦截，False 表示仍被拦截。
     """
     ws_url = _ws_url_for_id(port, tab_id)
@@ -1181,33 +1214,30 @@ def _check_and_handle_block(port, tab_id, url, base_dir, max_wait=300):
         alert_signin(url, screenshot_path=ss_path)
         return False
 
-    # ── 验证码：立即邮件通知，等待人工解决（不自动绕过） ──
+    # ── 人机验证：不截图、不通知，安静等人工（等满就整轮收工） ──
     if "captcha" in block_type:
-        print(f"  [拦截处理] 检测到人机验证，发送邮件通知，等待人工（最多 {max_wait}s）...")
-        ss_path = str(_screenshots_dir(base_dir) / f"_captcha_{time.strftime('%Y%m%d_%H%M%S')}.png")
-        try:
-            ws_url = _ws_url_for_id(port, tab_id)
-            _take_screenshot(ws_url, ss_path, clip_rect=result.get("rect"))
-        except Exception:
-            ss_path = None
-        alert_captcha(url, screenshot_path=ss_path)
+        if _captcha_abort.is_set():
+            return False        # 别的 worker 已经等超时了，不用再陪等一轮
+        print(f"  [人机验证] 请到 Chrome 窗口手动通过 —— 最多等 {max_wait // 60} 分钟")
 
         elapsed = 0
-        poll = 15
         while elapsed < max_wait:
-            time.sleep(poll)
-            elapsed += poll
+            time.sleep(CAPTCHA_POLL_SEC)
+            elapsed += CAPTCHA_POLL_SEC
+            if _captcha_abort.is_set():
+                return False
             try:
                 ws_url = _ws_url_for_id(port, tab_id)
                 check = _run_js(ws_url, _JS_DETECT_BLOCK)
                 if not isinstance(check, dict) or not check.get("blocked"):
-                    print(f"  [拦截处理] 验证码已通过（等了 {elapsed}s）")
+                    print(f"  [人机验证] 已通过（等了 {elapsed}s），继续")
                     return True
             except Exception:
                 pass
-            print(f"  [拦截处理] 仍在等待验证码... ({elapsed}/{max_wait}s)")
+            print(f"  [人机验证] 仍在等待... ({elapsed}/{max_wait}s)")
 
-        print("  [拦截处理] 验证码等待超时")
+        print(f"  [人机验证] 等了 {max_wait // 60} 分钟没人处理 —— 本轮到此为止")
+        _captcha_abort.set()
         return False
 
     return True
@@ -1590,24 +1620,49 @@ def _picture_column_inner_width_px(ws, col: int) -> int:
 
 
 def save_workbook_atomic(wb, path) -> "Path":
-    """保存工作簿：先写同目录的临时文件 → 验证能打开 → 原子替换目标。
+    """保存工作簿：本地盘写临时文件并自检 → 拷到目标卷 → 原子替换目标。
 
     直接 `wb.save(目标)` 是危险的：openpyxl 流式写 zip，`[Content_Types].xml`
     最后才写。保存中途抛异常（比如某张图读不到）会留下一个「有图片、没清单」
     的半截文件，而原内容已经被覆盖 —— 员工的总表就是这么坏的。
 
-    临时文件放在同一个目录（同一卷）才能保证 os.replace 是原子的。
+    自检必须在本地盘做：目标一般是 Google Drive 的虚拟盘，刚写完的大文件立刻
+    读回来经常还没落地（见 ① 的注释）。目标卷只接一次已经验证过的整文件拷贝，
+    落在同一卷上 os.replace 才是原子的。
     保存失败时目标文件一个字节都不会变，异常原样抛给调用方。
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.stem}.tmp-{os.getpid()}-{threading.get_ident()}.xlsx")
+    tag = f"{os.getpid()}-{threading.get_ident()}"
+    tmp = path.with_name(f".{path.stem}.tmp-{tag}.xlsx")
 
-    err = _write_workbook_to_temp(wb, tmp)
+    # ① 先写**本地磁盘**的临时文件并自检。
+    # 不在目标目录原地自检：目标一般是 Google Drive 的虚拟盘（D:\共享云端硬盘），
+    # 刚写完的大文件立刻读回来经常还没落地，zipfile 直接 BadZipFile —— 文件其实
+    # 是好的，是「写完马上读回」这一眼不可靠（2026-08-17 现场，57MB 的总表）。
+    # 本地盘读回是可靠的，openpyxl 写到一半炸掉照样能在这里拦住。
+    local_tmp = Path(tempfile.gettempdir()) / f".shein-save-{tag}.xlsx"
+    err = _write_workbook_to_temp(wb, local_tmp)
     if err is not None:
-        _discard_temp(tmp)
+        _discard_temp(local_tmp)
         raise ExcelSaveError(f"{path.name} 保存失败（原文件未改动）: {err}")
 
+    # ② 复制到目标卷的临时文件（os.replace 要同卷才是原子的）
+    try:
+        expect = local_tmp.stat().st_size
+        shutil.copyfile(local_tmp, tmp)
+        got = _settled_size(tmp, expect)
+        if got != expect:
+            raise ExcelSaveError(
+                f"{path.name} 保存失败（原文件未改动）: "
+                f"复制到目标盘后大小对不上（{got} != {expect}）")
+    except BaseException:
+        _discard_temp(tmp)
+        raise
+    finally:
+        _discard_temp(local_tmp)
+
+    # ③ 原子替换
     try:
         os.replace(tmp, path)
     except OSError:
@@ -1616,8 +1671,85 @@ def save_workbook_atomic(wb, path) -> "Path":
     return path
 
 
+def _settled_size(p: "Path", expect: int, tries: int = 5) -> int:
+    """读 `p` 的大小，等它稳定到 `expect`。云盘刚落地时 stat 可能还是旧值。"""
+    size = -1
+    for i in range(tries):
+        try:
+            size = p.stat().st_size
+        except OSError:
+            size = -1
+        if size == expect:
+            return size
+        time.sleep(0.4 * (i + 1))
+    return size
+
+
 class ExcelSaveError(Exception):
     """写临时文件阶段失败。目标文件保证没被动过。"""
+
+
+def _cache_image_bytes(img, data: bytes) -> None:
+    """把 `data` 钉成这张图的字节，之后每次 save 都返回同一份。
+
+    openpyxl 的 `Image._data()` 读完字节就 `fp.close()`，而那个 fp 就是
+    `img.ref` 那个 BytesIO —— 不管是 `_add_picture_to_cell` 塞进去的，还是
+    `load_workbook` 从已有文件里读出来的。不钉住的话同一个 wb 存第二次必然抛
+    `ValueError: I/O operation on closed file`，多 sheet 时第二个 sheet 保存
+    就中断整轮（2026-08-17 现场）。
+    """
+    img._cached_bytes = data
+    img._data = lambda _d=data: _d
+
+
+def _shrink_image_bytes(data: bytes) -> "bytes | None":
+    """把过大的图重新压成缩略图 JPEG。压不动或压不小就返回 None。
+
+    针对的是历史文件：以前嵌进去的是整张原图的 PNG（一张 0.7–2MB），
+    员工的总表已经 57MB 了，Web 版 Excel 打不开。显示尺寸本来就只有
+    PICTURE_MAX_HEIGHT_PX 高，重采样到那个量级完全够看。
+    """
+    try:
+        with PILImage.open(BytesIO(data)) as im:
+            im.load()
+            box = PICTURE_MAX_HEIGHT_PX
+            small, _, _ = _encode_thumbnail_jpeg(im, box * 4, box)
+    except Exception:
+        return None
+    return small if len(small) < len(data) else None
+
+
+def _harden_workbook_images(wb) -> None:
+    """保存前把每张图的字节钉住，顺手把过大的旧图压小。
+
+    读不出来的图直接摘掉，不能拖累整次保存。
+    """
+    shrunk_n = shrunk_saved = 0
+    for ws in getattr(wb, "worksheets", []):
+        images = getattr(ws, "_images", None)
+        if not images:
+            continue
+        kept = []
+        for img in images:
+            if getattr(img, "_cached_bytes", None) is None:
+                try:
+                    data = img._data()
+                except Exception as e:
+                    print(f"  [图片] 保存时跳过一张读不出来的图: {type(e).__name__}: {e}")
+                    continue
+                if len(data) > PICTURE_MAX_BYTES:
+                    small = _shrink_image_bytes(data)
+                    if small is not None:
+                        shrunk_n += 1
+                        shrunk_saved += len(data) - len(small)
+                        data, img.format = small, "jpeg"
+                _cache_image_bytes(img, data)
+            kept.append(img)
+        if len(kept) != len(images):
+            ws._images = kept
+    if shrunk_n:
+        print(f"  [图片] 压缩了 {shrunk_n} 张大图，省下 "
+              f"{shrunk_saved / 1024 / 1024:.1f}MB")
 
 
 def _write_workbook_to_temp(wb, tmp: "Path") -> "str | None":
@@ -1627,6 +1759,7 @@ def _write_workbook_to_temp(wb, tmp: "Path") -> "str | None":
     close 的 ZipFile，Windows 上就删不掉 tmp 了。只带走类型和消息。
     """
     try:
+        _harden_workbook_images(wb)
         wb.save(tmp)
         with zipfile.ZipFile(tmp) as z:
             if z.testzip() is not None:
@@ -1648,29 +1781,54 @@ def _discard_temp(tmp: "Path") -> None:
             gc.collect()
 
 
+def _encode_thumbnail_jpeg(im, box_w: int, box_h: int) -> "tuple[bytes, int, int]":
+    """把 PIL 图缩到 box 里，按 PICTURE_SUPERSAMPLE 倍重采样存成 JPEG。
+
+    返回 (jpeg 字节, 显示宽, 显示高)。显示尺寸按原图比例塞进 box_w × box_h，
+    实际存下来的像素是显示尺寸的 PICTURE_SUPERSAMPLE 倍（不超过原图分辨率）。
+    JPEG 不支持透明，带 alpha 的先合到白底上。
+    """
+    ow, oh = max(1, im.width), max(1, im.height)
+    scale = min(box_w / ow, box_h / oh, 1.0)
+    disp_w, disp_h = max(1, int(ow * scale)), max(1, int(oh * scale))
+
+    px_w = min(ow, disp_w * PICTURE_SUPERSAMPLE)
+    px_h = min(oh, disp_h * PICTURE_SUPERSAMPLE)
+    if (px_w, px_h) != (ow, oh):
+        im = im.resize((max(1, px_w), max(1, px_h)), PILImage.LANCZOS)
+
+    if im.mode in ("RGBA", "LA", "P"):
+        im = im.convert("RGBA")
+        flat = PILImage.new("RGB", im.size, (255, 255, 255))
+        flat.paste(im, mask=im.split()[-1])
+        im = flat
+    elif im.mode != "RGB":
+        im = im.convert("RGB")
+
+    buf = BytesIO()
+    im.save(buf, format="JPEG", quality=PICTURE_JPEG_QUALITY,
+            optimize=True, progressive=False)
+    return buf.getvalue(), disp_w, disp_h
+
+
 def _add_picture_to_cell(ws, row: int, col: int, image_path: "Path") -> int:
     if not Path(image_path).is_file():
         return 0
+    max_w = _picture_column_inner_width_px(ws, col)
+    max_h = PICTURE_MAX_HEIGHT_PX
     try:
-        # 现在就把图片读进内存并转成 PNG，不要让 openpyxl 拿着路径等到
-        # wb.save() 再回磁盘重读 —— 那时候再失败就会写坏整个文件。
+        # 现在就把图片读进内存并压好，不要让 openpyxl 拿着路径等到 wb.save()
+        # 再回磁盘重读 —— 那时候再失败就会写坏整个文件。
         # 顺带解决 Excel 不认 webp 的问题（openpyxl 只放行 gif/jpeg/png）。
-        buf = BytesIO()
         with PILImage.open(image_path) as im:
             im.load()
-            if im.mode not in ("RGB", "RGBA", "L"):
-                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
-            im.save(buf, format="PNG")
-        buf.seek(0)
-        xl_img = XLImage(buf)
+            data, nw, nh = _encode_thumbnail_jpeg(im, max_w, max_h)
+        xl_img = XLImage(BytesIO(data))
+        xl_img.format = "jpeg"
+        _cache_image_bytes(xl_img, data)
     except Exception as e:
         print(f"  [图片] 跳过 {Path(image_path).name}: {type(e).__name__}: {e}")
         return 0
-    ow, oh = max(1, int(xl_img.width)), max(1, int(xl_img.height))
-    max_w = _picture_column_inner_width_px(ws, col)
-    max_h = PICTURE_MAX_HEIGHT_PX
-    scale = min(max_w / ow, max_h / oh, 1.0)
-    nw, nh = max(1, int(ow * scale)), max(1, int(oh * scale))
     xl_img.width = nw
     xl_img.height = nh
     col_letter = get_column_letter(col)
@@ -2715,8 +2873,12 @@ def _scrape_one_url(
     线程安全：每次调用开自己的 tab、用自己的 WebSocket。绝不向外抛异常
     （异常包成 rec["status"]）。返回前无条件睡 2–3 秒（含自己手上的最后一条）。
     """
-    print(f"[{index}/{total}] {url[:80]}...")
     rec = {"url": url, "status": "OK", "seq_num": seq_num}
+    # 人机验证已经等超时了：这条根本没开始跑，别开 tab、也别标 Failed
+    if _captcha_abort.is_set():
+        rec["status"] = "CAPTCHA_ABORTED"
+        return rec
+    print(f"[{index}/{total}] {url[:80]}...")
     tab_id = None
     _url_start_time = time.monotonic()
     try:
@@ -2726,7 +2888,7 @@ def _scrape_one_url(
         # 检测登录/验证码拦截
         base_dir = Path.cwd()
         if not _check_and_handle_block(CDP_PORT, tab_id, url, base_dir):
-            rec["status"] = "BLOCKED"
+            rec["status"] = "CAPTCHA_ABORTED" if _captcha_abort.is_set() else "BLOCKED"
             print("  [跳过] 页面被拦截，无法提取")
             return rec
         # 重置提取超时计时器：拦截处理（尤其验证码）可能耗时数分钟
@@ -2793,25 +2955,38 @@ def _scrape_one_url(
                     _recheck = _run_js(ws_url, _JS_DETECT_BLOCK)
                 except Exception:
                     pass
-                # 无论是否检测到验证码，都截图通知
-                ss_path = str(_screenshots_dir(base_dir) / f"_timeout_{time.strftime('%Y%m%d_%H%M%S')}.png")
-                try:
-                    ws_url = _ws_url_for_id(CDP_PORT, tab_id)
-                    _take_screenshot(ws_url, ss_path)
-                except Exception:
-                    ss_path = None
-                _block_info = ""
-                if isinstance(_recheck, dict) and _recheck.get("blocked"):
-                    _block_info = f"\n检测到拦截类型: {_recheck.get('type', 'unknown')}"
-                alert_generic(
-                    url,
-                    f"页面处理超时（{_elapsed:.0f}s > {EXTRACTION_TIMEOUT_SEC}s），"
-                    f"可能存在隐形验证码或页面加载异常。{_block_info}",
-                    screenshot_path=ss_path,
-                )
-                rec["status"] = "TIMEOUT"
-                data = None
-                break
+                # 是人机验证就安静处理（等人工，见 _check_and_handle_block），
+                # 只有非验证码的超时才截图 + 通知
+                _is_captcha = (isinstance(_recheck, dict)
+                               and "captcha" in str(_recheck.get("type") or ""))
+                if _is_captcha:
+                    if not _check_and_handle_block(CDP_PORT, tab_id, url, base_dir):
+                        rec["status"] = ("CAPTCHA_ABORTED" if _captcha_abort.is_set()
+                                         else "BLOCKED")
+                        data = None
+                        break
+                    # 人工过了验证码：等待的时间不算超时，落到下面照常提取
+                    _url_start_time = time.monotonic()
+                    try:
+                        ws_url = _ws_url_for_id(CDP_PORT, tab_id)
+                    except Exception:
+                        pass
+                else:
+                    ss_path = str(_screenshots_dir(base_dir) / f"_timeout_{time.strftime('%Y%m%d_%H%M%S')}.png")
+                    try:
+                        ws_url = _ws_url_for_id(CDP_PORT, tab_id)
+                        _take_screenshot(ws_url, ss_path)
+                    except Exception:
+                        ss_path = None
+                    alert_generic(
+                        url,
+                        f"页面处理超时（{_elapsed:.0f}s > {EXTRACTION_TIMEOUT_SEC}s），"
+                        f"可能是页面加载异常。",
+                        screenshot_path=ss_path,
+                    )
+                    rec["status"] = "TIMEOUT"
+                    data = None
+                    break
 
             print("  extracting...")
             data = _run_js(ws_url, _JS)
@@ -2966,6 +3141,7 @@ def _run_scrape_pool(urls, seq_list, price_list, shipping_list,
     """
     total = len(urls)
     _reset_rate_limit_state()
+    _captcha_abort.clear()
 
     def _seq(i):
         return seq_list[i] if seq_list else start_seq + i
@@ -3002,6 +3178,13 @@ def _run_scrape_pool(urls, seq_list, price_list, shipping_list,
                     progress_cb(done, total, rec.get("url", ""))
                 except Exception:
                     pass
+            if _captcha_abort.is_set():
+                print("\n  [人机验证] 等待超时，本轮不再抓后续 URL")
+                for other in fut_to_seq:
+                    if not other.done():
+                        other.cancel()
+                break
+
             if _record_result_for_rate_limit(rec.get("status") or "OK"):
                 rate_limited = True
                 print(f"\n  [限流] 连续 {RATE_LIMIT_CONSECUTIVE} 个 URL 失败，"
@@ -3024,10 +3207,11 @@ def _run_scrape_pool(urls, seq_list, price_list, shipping_list,
         records.append(rec)
         collected.add(seq_num)
 
-    if rate_limited:
+    if rate_limited or _captcha_abort.is_set():
+        leftover = "CAPTCHA_ABORTED" if _captcha_abort.is_set() else "RATE_LIMITED"
         for i in range(total):
             if _seq(i) not in collected:
-                records.append({"url": urls[i], "status": "RATE_LIMITED",
+                records.append({"url": urls[i], "status": leftover,
                                 "seq_num": _seq(i)})
                 collected.add(_seq(i))
 
@@ -3115,7 +3299,18 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
     #     if retry_path.exists():
     #         retry_path.unlink(missing_ok=True)
 
+    # 提前收工的两种情况都把 records 带上：调用方要靠它把已经抓好的行写回表，
+    # 不然一整批抓好的商品会跟着异常一起丢掉。
+    if _captcha_abort.is_set():
+        raise CaptchaAbort(
+            f"人机验证等待超过 {CAPTCHA_WAIT_SEC // 60} 分钟没人处理，本轮结束",
+            records=records,
+        )
+
     if _rate_limited:
-        raise RateLimitError(f"Shein 限流：连续 {RATE_LIMIT_CONSECUTIVE} 个 URL 失败")
+        raise RateLimitError(
+            f"Shein 限流：连续 {RATE_LIMIT_CONSECUTIVE} 个 URL 失败",
+            records=records,
+        )
 
     return records

@@ -239,7 +239,7 @@ class Wizard:
             ("输入 Excel 文件夹", "submitted_dir", True),
             ("输入 Excel 文件名", "input_filename", False),
             ("输出根目录（留空 = 同输入文件夹）", "output_dir", True),
-            ("备份目录（建议独立的备份共享盘）", "backup_dir", True),
+            ("备份目录（留空 = 同输入文件夹）", "backup_dir", True),
         ]
         self._entries = {}
 
@@ -292,21 +292,18 @@ class Wizard:
                     f"输出目录创建失败:\n{e}\n\n仍然继续？（运行时再创建）",
                 ):
                     return
-            bd = Path(self.values["backup_dir"])
-            if not bd.parent.is_dir():
-                if not messagebox.askyesno(
-                    "备份目录父目录不存在",
-                    f"备份目录的父目录不存在:\n{bd.parent}\n\n仍然继续？",
-                ):
-                    return
+            # 备份目录留空 → 跟输入文件夹同目录。备份建不出来不再挡路：
+            # run_excel.backup_excel 会自己退回输入目录，备份不是开跑的前提。
+            if not self.values["backup_dir"]:
+                self.values["backup_dir"] = str(sd)
             try:
-                bd.mkdir(parents=True, exist_ok=True)
+                Path(self.values["backup_dir"]).mkdir(parents=True, exist_ok=True)
             except Exception as e:
-                if not messagebox.askyesno(
-                    "无法创建备份目录",
-                    f"备份目录创建失败:\n{e}\n\n仍然继续？（运行时再创建）",
-                ):
-                    return
+                messagebox.showwarning(
+                    "备份目录暂时不可用",
+                    f"备份目录创建失败:\n{e}\n\n"
+                    "不影响使用：跑的时候会自动把备份放到输入文件夹。",
+                )
             self._next()
 
         self._nav_buttons(on_next=on_next)

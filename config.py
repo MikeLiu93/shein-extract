@@ -82,11 +82,14 @@ COMPLETED_ROOT = Path(os.environ.get(
     str(AUTO_PIPELINE_BASE / "Listing - completed"),
 ))
 
-# ── Backup directory (independent shared drive — no longer derived from DRIVE) ─
-# Priority: SHEIN_BACKUP_DIR > legacy SHEIN_BACKUP_BASE > legacy default on personal Drive.
+# ── Backup directory ──────────────────────────────────────────────────────────
+# Priority: SHEIN_BACKUP_DIR > legacy SHEIN_BACKUP_BASE > 输入目录。
+# v3.8.2: 默认值从 {DRIVE}\我的云端硬盘\Backup\Shein\总表 改成输入目录本身。
+# 那个老默认值指向一个多数机器上根本不存在的盘符，没配备份路径的员工连
+# mkdir 都过不去，整轮直接跑不起来 —— 备份不该成为开跑的前提条件。
 _backup = (
     os.environ.get("SHEIN_BACKUP_DIR")
     or os.environ.get("SHEIN_BACKUP_BASE")
-    or rf"{DRIVE}\我的云端硬盘\Backup\Shein\总表"
+    or str(SUBMITTED_DIR)
 )
 BACKUP_DIR = Path(_backup)
