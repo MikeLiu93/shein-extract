@@ -921,7 +921,40 @@ def _cdp_available(port=CDP_PORT) -> bool:
         return False
 
 
+def _port_is_bindable(port: int) -> bool:
+    """能 bind 到 127.0.0.1:port 就是空的。真的占用 / 占着不放的会 bind 失败。"""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+
+
+def _pick_free_cdp_port(preferred: int, max_tries: int = 10) -> int:
+    """从 preferred 开始找一个"要么已经跑着我们的 CDP、要么能 bind"的端口。
+
+    3.9.0 加的：员工机器上 9222 被别的东西占死（企业杀软、VPN 挂钩、上一次脚
+    本遗留的死 Chrome）时，不要只会告诉用户"手动杀 chrome"——自动顺着往上找
+    一个空的，继续跑。
+    """
+    for i in range(max_tries):
+        p = preferred + i
+        if _cdp_available(p):
+            return p
+        if _port_is_bindable(p):
+            return p
+    return preferred
+
+
 def _ensure_chrome(port=CDP_PORT):
+    global CDP_PORT
+    chosen = _pick_free_cdp_port(port)
+    if chosen != port:
+        print(f"  [Chrome] 端口 {port} 被占，自动改用 {chosen}")
+        CDP_PORT = chosen
+        port = chosen
     if _cdp_available(port):
         print(f"  Reusing existing Chrome on port {port}")
         return None, None, False
@@ -1620,7 +1653,7 @@ def _picture_column_inner_width_px(ws, col: int) -> int:
 
 
 def save_workbook_atomic(wb, path) -> "Path":
-    """保存工作簿：本地盘写临时文件并自检 → 拷到目标卷 → 原子替换目标。
+    """保存工作簿：本地盘写临时文件并自检 → 拷到目标卷并二次自检 → 原子替换。
 
     直接 `wb.save(目标)` 是危险的：openpyxl 流式写 zip，`[Content_Types].xml`
     最后才写。保存中途抛异常（比如某张图读不到）会留下一个「有图片、没清单」
@@ -1629,7 +1662,9 @@ def save_workbook_atomic(wb, path) -> "Path":
     自检必须在本地盘做：目标一般是 Google Drive 的虚拟盘，刚写完的大文件立刻
     读回来经常还没落地（见 ① 的注释）。目标卷只接一次已经验证过的整文件拷贝，
     落在同一卷上 os.replace 才是原子的。
-    保存失败时目标文件一个字节都不会变，异常原样抛给调用方。
+
+    3.9.0 加强：copy 到目标盘以后再做一次 zip 自检 + 关键 part 完整性检查。
+    杀毒 / Drive FUSE / OneDrive 共存都见过"size 对但字节被动过"的现场。
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1656,6 +1691,8 @@ def save_workbook_atomic(wb, path) -> "Path":
             raise ExcelSaveError(
                 f"{path.name} 保存失败（原文件未改动）: "
                 f"复制到目标盘后大小对不上（{got} != {expect}）")
+        # 二次自检：目标盘上的 tmp 可能被杀毒 / FUSE 层动过字节
+        _verify_xlsx_integrity(tmp, f"{path.name} 目标盘 tmp")
     except BaseException:
         _discard_temp(tmp)
         raise
@@ -1669,6 +1706,45 @@ def save_workbook_atomic(wb, path) -> "Path":
         _discard_temp(tmp)
         raise
     return path
+
+
+_REQUIRED_XLSX_PARTS = ("[Content_Types].xml", "xl/workbook.xml")
+
+
+def _verify_xlsx_integrity(path: "Path", label: str, retries: int = 3) -> None:
+    """校验一个 xlsx 的 zip 完整性。不通过抛 ExcelSaveError。
+
+    3.9.0 引入。覆盖 CRC + 关键 part 存在性：之前只检查了 CRC 和
+    `[Content_Types].xml`——不够。openpyxl 写一半抛异常留下的坏文件可能
+    CRC 正确但 `xl/workbook.xml` 或 `xl/worksheets/sheet*.xml` 缺失，Excel
+    打开时就会报"文件已损坏，是否修复"。
+
+    对 `BadZipFile` 做短暂重试：Google Drive FUSE 偶尔会在写入刚结束的那
+    一瞬间返回不完整字节流（2026-08-17 现场）；真坏文件重试几次也还是坏，
+    不是坏文件的话重试一次就 OK。关键 part 缺失不重试——那是实打实的结构
+    问题，不是瞬时假读。
+    """
+    last_bzerr = None
+    for i in range(max(1, retries)):
+        try:
+            with zipfile.ZipFile(path) as z:
+                if z.testzip() is not None:
+                    raise ExcelSaveError(f"{label} zip CRC 校验失败")
+                names = set(z.namelist())
+                for required in _REQUIRED_XLSX_PARTS:
+                    if required not in names:
+                        raise ExcelSaveError(f"{label} 缺少必要 part: {required}")
+                if not any(n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
+                           for n in names):
+                    raise ExcelSaveError(f"{label} 没有任何工作表 XML")
+            return
+        except zipfile.BadZipFile as e:
+            last_bzerr = e
+            if i < retries - 1:
+                time.sleep(0.4 * (i + 1))
+    raise ExcelSaveError(
+        f"{label} 不是合法的 zip（重试 {retries} 次都坏）: {last_bzerr}"
+    ) from None
 
 
 def _settled_size(p: "Path", expect: int, tries: int = 5) -> int:
@@ -1697,9 +1773,16 @@ def _cache_image_bytes(img, data: bytes) -> None:
     `load_workbook` 从已有文件里读出来的。不钉住的话同一个 wb 存第二次必然抛
     `ValueError: I/O operation on closed file`，多 sheet 时第二个 sheet 保存
     就中断整轮（2026-08-17 现场）。
+
+    3.9.0 双保险：有些 openpyxl 版本的 writer 走 `img.ref` 直接读而不是
+    `_data()`，光劫持 `_data` 不够；再给 `img.ref` 塞一份 BytesIO。
     """
     img._cached_bytes = data
     img._data = lambda _d=data: _d
+    try:
+        img.ref = BytesIO(data)
+    except Exception:
+        pass
 
 
 def _shrink_image_bytes(data: bytes) -> "bytes | None":
@@ -1723,6 +1806,11 @@ def _harden_workbook_images(wb) -> None:
     """保存前把每张图的字节钉住，顺手把过大的旧图压小。
 
     读不出来的图直接摘掉，不能拖累整次保存。
+
+    3.9.0：对已经缓存过字节的图也要刷新 `img.ref`，上一轮 save 把那个 BytesIO
+    消耗 / close 掉了，不重置的话下一轮 save 走 `img.ref` 路径就是读空流。
+    丢图的时候同时清掉 ws._drawing，让 openpyxl 下次重建 drawing xml，避免
+    留下引用已删除 image 的悬空 rels。
     """
     shrunk_n = shrunk_saved = 0
     for ws in getattr(wb, "worksheets", []):
@@ -1731,7 +1819,8 @@ def _harden_workbook_images(wb) -> None:
             continue
         kept = []
         for img in images:
-            if getattr(img, "_cached_bytes", None) is None:
+            cached = getattr(img, "_cached_bytes", None)
+            if cached is None:
                 try:
                     data = img._data()
                 except Exception as e:
@@ -1744,9 +1833,21 @@ def _harden_workbook_images(wb) -> None:
                         shrunk_saved += len(data) - len(small)
                         data, img.format = small, "jpeg"
                 _cache_image_bytes(img, data)
+            else:
+                # 已缓存：上次 save 的 BytesIO 可能被 close 了，重新塞一份新鲜的
+                try:
+                    img.ref = BytesIO(cached)
+                except Exception:
+                    pass
             kept.append(img)
         if len(kept) != len(images):
             ws._images = kept
+            # drop 了图：重置 drawing，让 openpyxl 下次 save 时按新 _images 重建
+            if hasattr(ws, "_drawing"):
+                try:
+                    ws._drawing = None
+                except Exception:
+                    pass
     if shrunk_n:
         print(f"  [图片] 压缩了 {shrunk_n} 张大图，省下 "
               f"{shrunk_saved / 1024 / 1024:.1f}MB")
@@ -1761,11 +1862,9 @@ def _write_workbook_to_temp(wb, tmp: "Path") -> "str | None":
     try:
         _harden_workbook_images(wb)
         wb.save(tmp)
-        with zipfile.ZipFile(tmp) as z:
-            if z.testzip() is not None:
-                return "临时文件 zip 校验失败"
-            if "[Content_Types].xml" not in z.namelist():
-                return "临时文件缺少 [Content_Types].xml（只写了一半）"
+        _verify_xlsx_integrity(tmp, "本地临时文件")
+    except ExcelSaveError as e:
+        return str(e)
     except BaseException as e:
         return f"{type(e).__name__}: {e}"
     return None

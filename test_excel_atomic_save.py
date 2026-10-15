@@ -168,11 +168,12 @@ def test_workbook_is_verified_before_anything_touches_the_destination():
 
 
 def test_save_survives_a_destination_that_lies_on_read_back():
-    """目标盘刚写完的文件读回来是坏的 —— 保存仍然必须成功。
+    """目标盘刚写完的文件读回来头一下是坏的 —— 保存仍然必须成功。
 
     Google Drive 虚拟盘上 57MB 的总表就是这样：`wb.save(tmp)` 成功，紧接着
     `zipfile.ZipFile(tmp)` 抛 BadZipFile（2026-08-17 现场）。文件其实是好的，
-    是那一眼读回来不可靠。自检搬到本地盘之后这条路就不该再炸。
+    是那一眼读回来不可靠。3.9.0 的 `_verify_xlsx_integrity` 对 `BadZipFile`
+    做了短暂重试，一两次之后 Drive 就把真实字节服务出来了。
     """
     import shein_scraper
     tmp = Path(tempfile.mkdtemp())
@@ -182,14 +183,20 @@ def test_save_survives_a_destination_that_lies_on_read_back():
         target = dest_dir / "总表.xlsx"
 
         real_zipfile = shein_scraper.zipfile.ZipFile
+        lie_counts: dict = {}
 
-        class LyingZipFile(real_zipfile):
+        class LyingOnFirstZipFile(real_zipfile):
+            """前 2 次假读失败，第 3 次服务真实字节 —— 模拟 Drive 瞬时假读。"""
             def __init__(self, file, *a, **kw):
-                if dest_dir in Path(str(file)).parents:
-                    raise zipfile.BadZipFile("File is not a zip file")
+                key = str(file)
+                if dest_dir in Path(key).parents:
+                    n = lie_counts.get(key, 0)
+                    lie_counts[key] = n + 1
+                    if n < 2:
+                        raise zipfile.BadZipFile("File is not a zip file")
                 super().__init__(file, *a, **kw)
 
-        shein_scraper.zipfile.ZipFile = LyingZipFile
+        shein_scraper.zipfile.ZipFile = LyingOnFirstZipFile
         try:
             img = _make_webp(tmp / "img_001.webp")
             wb = Workbook()

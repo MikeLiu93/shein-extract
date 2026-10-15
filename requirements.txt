@@ -1,3 +1,6 @@
-openpyxl>=3.1
+# openpyxl 版本钉死：3.9.0 之后保存链路对 openpyxl 的内部 API（_data /
+# _images / _drawing / img.ref）有多处依赖。升到 3.2 可能改 writer 行为，
+# 老员工机器 `pip install -U` 自动升级会炸整轮保存——必须钉在验证过的版本上。
+openpyxl==3.1.5
 requests>=2.28
 websocket-client>=1.5
