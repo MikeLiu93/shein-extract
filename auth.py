@@ -4,7 +4,9 @@ Password gate with central revocation.
 How it works
 ============
 1. On launch we fetch a small JSON allowlist from a URL the owner controls
-   (current default: raw.githubusercontent.com/<owner>/<repo>/main/auth.json).
+   (current default: a public gist served from gist.githubusercontent.com;
+   see AUTH_URL below). Hosted on a gist rather than the code repo so the
+   code repo can stay private without breaking anonymous auth fetch.
 2. The user types a password; we SHA-256 it and check membership.
 3. We cache the verified hash + timestamp under %APPDATA%\\shein-extract\\.
    For the next 24h, launches are silent — we only re-prompt if the cache
@@ -15,9 +17,9 @@ How it works
 
 Revoking access
 ===============
-Edit auth.json in the repo, push commit. Within 24h every employee's exe
-will detect the change on next launch and force a re-prompt with the new
-password (or fail outright if their hash was removed).
+Edit the gist (gh gist edit <id>, or the gist web UI) and save. Within 24h
+every employee's exe will detect the change on next launch and force a
+re-prompt with the new password (or fail outright if their hash was removed).
 
 auth.json schema (forward-compatible — supports per-team passwords later)
 ============================================================
@@ -48,7 +50,7 @@ import requests
 
 AUTH_URL = os.environ.get(
     "SHEIN_AUTH_URL",
-    "https://raw.githubusercontent.com/MikeLiu93/shein-extract/main/auth.json",
+    "https://gist.githubusercontent.com/MikeLiu93/23718a882e2a53a35a6fee52d1e71b84/raw/auth.json",
 )
 CACHE_FILE = (
     Path(os.environ.get("APPDATA", str(Path.home())))

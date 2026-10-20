@@ -1,5 +1,11 @@
 # Shein Product Scraper - CHANGELOG
 
+## v3.9.1 — 2026-10-20
+- **AUTH_URL 迁到 public gist**。原来挂在 `raw.githubusercontent.com/MikeLiu93/shein-extract/main/auth.json`，仓库一旦转 private 匿名请求 404 → 员工 exe 启动失败。现在改成 `gist.githubusercontent.com/.../23718a882e2a53a35a6fee52d1e71b84/raw/auth.json`。gist 本身是 public、与 code 仓库解耦，之后 code 仓库可以转 private 而不影响身份校验。撤销账户的操作改成「`gh gist edit <id>` 或 gist web UI 编辑后保存」。
+
+## v3.9.0 — 2026-10-19（事后补）
+- **Excel 保存硬化 + 端口自动试探**。见 `0b2f86e`。
+
 ## v3.8.3 — 2026-08-17
 - **修复保存失败 `BadZipFile: File is not a zip file`**。v3.8.2 修掉了图片被 close 的问题，但保存又栽在另一处：临时文件直接写在**目标目录**（Google Drive 虚拟盘 `D:\共享云端硬盘`）里，`wb.save(tmp)` 刚返回就 `zipfile.ZipFile(tmp)` 读回来自检 —— 文件其实是好的，是云盘上「写完马上读回」这一眼不可靠，57MB 的总表尤其明显。现在**自检在本地盘做完，目标盘只接一次已经验证过的整文件拷贝**，再原子替换。小文件（批次表、备份）一直没事也是这个原因。
 - **嵌进 Excel 的图片大幅压缩**。以前存的是整张原图的 PNG（一张 0.7–2MB），可显示尺寸只有 168px 高 —— 纯浪费。现在按显示尺寸的 2 倍重采样后存 JPEG（quality 80），一张 20–30KB。**真表实测：57.7MB → 2.4MB**，Web 版 Excel 打得开了，保存也从 17s 降到 4s。
