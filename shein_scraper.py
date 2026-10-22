@@ -2933,8 +2933,8 @@ def _download_media(rec: dict, base_dir: "Path", seq_num: "int | None" = None) -
                 except Exception:
                     pass
 
-    # ── 视频下载（串行，通常只有 1–2 个）──
-    mp4_urls = [u for u in videos if isinstance(u, str) and ".mp4" in u.lower()]
+    # ── 视频不再下载 — 员工只需要图片 ──
+    mp4_urls: list[str] = []
     downloaded_videos: list[Path] = []
     for idx, u in enumerate(mp4_urls):
         name = folder / f"_dl_vid_{idx:04d}"

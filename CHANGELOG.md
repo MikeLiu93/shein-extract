@@ -1,5 +1,8 @@
 # Shein Product Scraper - CHANGELOG
 
+## v3.9.2 — 2026-10-23
+- **不再下载视频**。员工反馈只要图片，产品页上那 1–2 个 mp4 视频抓下来后一直没人用。关掉能省带宽、省时间（120s 超时 × 1–2 个视频 × 每行 = 整轮运行每几十行省几分钟），下载失败不再拖累抓取。txt / Excel 流程完全不受影响，只是产品文件夹里不再出现 `video_001.mp4` / `video_002.mp4`。
+
 ## v3.9.1 — 2026-10-20
 - **AUTH_URL 迁到 public gist**。原来挂在 `raw.githubusercontent.com/MikeLiu93/shein-extract/main/auth.json`，仓库一旦转 private 匿名请求 404 → 员工 exe 启动失败。现在改成 `gist.githubusercontent.com/.../23718a882e2a53a35a6fee52d1e71b84/raw/auth.json`。gist 本身是 public、与 code 仓库解耦，之后 code 仓库可以转 private 而不影响身份校验。撤销账户的操作改成「`gh gist edit <id>` 或 gist web UI 编辑后保存」。
 
